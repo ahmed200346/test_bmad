@@ -56,9 +56,18 @@
 - `actor`: User who performed the action
 - `createdAt`: Timestamp
 
-## Key Invariants
+## Key Invariants & Relationships
 
 - **Task Duration:** `Task.durationHours >= 0.25`.
 - **Dependency Order:** `Task.startDate` cannot be before all its prerequisites' `Task.endDate`.
-- **Capacity Limit:** Sum of `Allocation.allocatedHours` for a specialist in a time window must be $\le$ `Specialist.availabilityHoursPerWeek` unless an `OverrideEvent` exists.
-- **Recovery Floor:** Intensive tasks must be separated by a minimum recovery interval (defined in domain rules).
+- **Foreign‑Key Relationships:** 
+  - `Task.id` referenced by `DependencyEdge.fromTaskId` and `DependencyEdge.toTaskId`.
+  - `Allocation.taskId` → `Task.id`.
+  - `Allocation.specialistId` → `Specialist.id`.
+  - `OverrideEvent.allocationId` → `Allocation.id`.
+  - `AuditEvent.entityId` references the primary key of the entity type indicated by `entityType`.
+- **Capacity Limit:** Sum of `Allocation.allocatedHours` for a specialist in a **weekly** time window must be ≤ `Specialist.availabilityHoursPerWeek` unless an `OverrideEvent` exists.
+- **Capacity Debt Lifecycle:** When an `OverrideEvent` creates capacity debt, the `capacityDebtAmount` is recorded and must be cleared either by manual reconciliation or automatically after a configurable grace period (default 30 days). The debt is considered resolved when the specialist’s weekly allocated hours fall below the capacity limit.
+- **Recovery Floor:** Intensive tasks (duration > 8 hours or fatigue score > 0.8) must be separated by a minimum **24 hour** recovery interval for the same specialist, unless an override is granted.
+
+

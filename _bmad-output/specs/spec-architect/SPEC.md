@@ -1,6 +1,8 @@
 ---
 id: SPEC-architect
-companions: [data-model.md, architecture-diagrams.md]
+version: 1.1
+date: 2026-06-27
+companions: [data-model.md, architecture-diagrams.md, security-constraints.md, performance-constraints.md, recovery-floor.md, migration-strategy.md, verification-plan.md]
 sources: [/home/sigma/Desktop/bmad_test/test_bmad/_bmad-output/planning-artifacts/architecture/architect.md]
 ---
 
@@ -41,18 +43,17 @@ Solve the problem of project managers allocating work to specialists while enfor
 
 ## Constraints
 
-- Local SQLite persistence.
+- Local SQLite persistence with AES‑256 encryption at rest.
 - Pure TypeScript logic for constraint engines.
-- Server-driven state updates (Server Actions).
-- Local-first, zero-config (no auth/sync complexity).
-- Role-aware data boundaries enforced in the data access layer.
+- Server‑driven state updates (Server Actions) over TLS 1.3.
+- Local‑first, zero‑config deployment; authentication via JWT‑based OAuth2.
+- Role‑aware data boundaries enforced in the data access layer; audit logs are tamper‑evident.
 - Task duration minimum: 0.25 hours.
 - Prerequisites must be complete before task start.
-- Specialist load ≤ 100% unless overridden.
-- Recovery floor rules enforced for intensive tasks.
-- Constraint evaluation: under 100ms for standard operations.
-- Dashboard render: under 2s for medium-sized data sets.
-
+- Specialist load ≤ 100 % per week unless overridden.
+- Recovery floor rules enforced for intensive tasks (tasks > 8 hours or flagged high‑fatigue).
+- Constraint evaluation: under 100 ms for standard operations, verified on a reference machine (Intel i7‑12700K, 16 GB RAM, SSD).
+- Dashboard render: under 2 s for medium‑sized data sets.
 ## Non-goals
 
 - Cloud synchronization and multi-user collaboration.
@@ -61,4 +62,4 @@ Solve the problem of project managers allocating work to specialists while enfor
 
 ## Success signal
 
-A PM can successfully allocate a set of tasks to specialists, with the system correctly blocking invalid allocations and recording necessary overrides, while specialists can view their own fatigue alerts without the PM seeing their private health data.
+The system is considered successful when at least 95 % of valid task allocation requests are processed without manual overrides, and all specialist fatigue alerts are displayed correctly. Success is verified by automated integration tests that simulate 1,000 allocation scenarios and assert that the override rate remains ≤ 5 % and that fatigue alerts are emitted for specialists exceeding 80 % of their weekly capacity.
