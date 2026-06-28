@@ -1,90 +1,161 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { Card } from '../ui/Card';
 import { Button } from '../ui/Button';
 import { OverrideModal } from './OverrideModal';
-
-type Task = { id: string; name: string };
-type Specialist = { id: string; name: string; load: number };
-
-const MOCK_TASKS: Task[] = [
-  { id: 't1', name: 'API Integration' },
-  { id: 't2', name: 'Auth Layer Setup' },
-  { id: 't3', name: 'Database Migration' },
-];
-
-const MOCK_SPECIALISTS: Specialist[] = [
-  { id: 's1', name: 'Marcus (Senior Dev)', load: 60 },
-  { id: 's2', name: 'Sarah (Architect)', load: 90 },
-  { id: 's3', name: 'Elena (Frontend)', load: 110 },
-];
+import { getSpecialists, Specialist } from '@/app/actions/specialists';
+import { getTasks, Task } from '@/app/actions/tasks';
+import { validateAllocation, allocateTask, AllocationRequest } from '@/app/actions/engine';
 
 export const AllocationInterface = () => {
+  const [tasks, setTasks] = useState<Task[]>([]);
+  const [specialists, setSpecialists] = useState<Specialist[]>([]);
   const [selectedTask, setSelectedTask] = useState<string>('');
   const [selectedSpecialist, setSelectedSpecialist] = useState<string>('');
+  const [validation, setValidation] = useState<{ valid: boolean; error: string; percentage: number } | null>(null);
   const [isOverrideOpen, setIsOverrideOpen] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
 
-  const currentSpecialist = MOCK_SPECIALISTS.find(s => s.id === selectedSpecialist);
-  const isOverloaded = currentSpecialist && currentSpecialist.load >= 100;
+  useEffect(() => {
+    const loadData = async () => {
+      const [t, s] = await Promise.all([getTasks(), getSpecialists()]);
+      setTasks(t);
+      setSpecialists(s.filter(sp => sp.isActive));
+    };
+    loadData();
+  }, []);
+
+  useEffect(() => {
+    const checkCapacity = async () => {
+      if (!selectedSpecialist || !selectedTask) {
+        setValidation(null);
+        return;
+      }
+
+      const task = tasks.find(t => t.id.toString() === selectedTask);
+      const spec = specialists.find(s => s.id.toString() === selectedSpecialist);
+
+      if (!task || !spec) return;
+
+      // Simulate a window (Current Week) for the sake of the demo
+      const today = new Date().toISOString().split('T')[0];
+      const nextWeek = new Date();
+      nextWeek.setDate(nextWeek.getDate() + 7);
+      const end = nextWeek.toISOString().split('T')[0];
+
+      const result = await validateAllocation({
+        specialistId: spec.id,
+        taskId: task.id,
+        hours: task.duration,
+        windowStart: today,
+        windowEnd: end,
+      });
+      setValidation(result);
+    };
+    checkCapacity();
+  }, [selectedTask, selectedSpecialist, tasks, specialists]);
+
+  const handleSave = async (overrideData?: { priority: string; rationale: string }) => {
+    setIsSaving(true);
+    try {
+      const task = tasks.find(t => t.id.toString() === selectedTask);
+      const spec = specialists.find(s => s.id.toString() === selectedSpecialist);
+      if (!task || !spec) throw new Error("Invalid selection");
+
+      const today = new Date().toISOString().split('T')[0];
+      const nextWeek = new Date();
+      nextWeek.setDate(nextWeek.getDate() + 7);
+      const end = nextWeek.toISOString().split('T')[0];
+
+      await allocateTask({
+        specialistId: spec.id,
+        taskId: task.id,
+        hours: task.duration,
+        windowStart: today,
+        windowEnd: end,
+      }, overrideData);
+
+      setSelectedTask('');
+      setSelectedSpecialist('');
+      setValidation(null);
+      setIsOverrideOpen(false);
+      alert("Allocation saved successfully.");
+    } catch (err: any) {
+      alert(err.message);
+    } finally {
+      setIsSaving(false);
+    }
+  };
 
   return (
     <>
-      <Card className="max-w-2xl mx-auto">
-        <div className="flex flex-col gap-8">
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-            <div className="flex flex-col gap-2">
-              <label className="text-xs font-bold uppercase text-slate-400">Task</label>
+      <Card className="max-w-2xl mx-auto border-none shadow-md bg-white">
+        <div className="flex flex-col gap-10 p-6">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
+            <div className="flex flex-col gap-3">
+              <label className="text-xs font-bold uppercase tracking-widest text-slate-400">Task Selection</label>
               <select
-                className="p-3 border border-slate-200 rounded-interactive bg-white text-slate-900"
+                className="p-3 border border-slate-200 rounded-interactive bg-slate-50 text-slate-900 focus:ring-2 focus:ring-primary outline-none transition-all cursor-pointer"
                 value={selectedTask}
                 onChange={(e) => setSelectedTask(e.target.value)}
               >
                 <option value="">Select a task...</option>
-                {MOCK_TASKS.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
+                {tasks.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
               </select>
             </div>
-            <div className="flex flex-col gap-2">
-              <label className="text-xs font-bold uppercase text-slate-400">Specialist</label>
+            <div className="flex flex-col gap-3">
+              <label className="text-xs font-bold uppercase tracking-widest text-slate-400">Specialist Selection</label>
               <select
-                className="p-3 border border-slate-200 rounded-interactive bg-white text-slate-900"
+                className="p-3 border border-slate-200 rounded-interactive bg-slate-50 text-slate-900 focus:ring-2 focus:ring-primary outline-none transition-all cursor-pointer"
                 value={selectedSpecialist}
                 onChange={(e) => setSelectedSpecialist(e.target.value)}
               >
                 <option value="">Select a specialist...</option>
-                {MOCK_SPECIALISTS.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+                {specialists.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
               </select>
             </div>
           </div>
 
-          <div className={`p-4 rounded-interactive border transition-all duration-300 ${
+          <div className={`p-5 rounded-interactive border transition-all duration-500 ${
             !selectedSpecialist ? 'bg-slate-50 border-slate-200 text-slate-400' :
-            isOverloaded ? 'bg-critical/10 border-critical text-critical' :
-            'bg-success/10 border-success text-success'
+            validation?.valid === false ? 'bg-critical/10 border-critical text-critical-dark shadow-sm' :
+            validation?.valid === true ? 'bg-success/10 border-success text-success-dark shadow-sm' :
+            'bg-slate-50 border-slate-200 text-slate-400'
           }`}>
-            <div className="text-sm font-medium">
-              {!selectedSpecialist ? (
-                "Please select a specialist to validate capacity."
-              ) : isOverloaded ? (
-                `Constraint Violation: ${currentSpecialist?.name} is at ${currentSpecialist?.load}% capacity.`
-              ) : (
-                `Sustainable Allocation: ${currentSpecialist?.name} has available capacity.`
-              )}
+            <div className="flex items-center gap-3">
+              <div className={`w-2 h-2 rounded-full ${
+                !selectedSpecialist ? 'bg-slate-300' :
+                validation?.valid === false ? 'bg-critical animate-pulse' :
+                validation?.valid === true ? 'bg-success' : 'bg-slate-300'
+              }`} />
+              <div className="text-sm font-medium leading-relaxed">
+                {!selectedSpecialist ? (
+                  "Please select a specialist to validate capacity constraints."
+                ) : validation?.valid === false ? (
+                  validation.error
+                ) : (
+                  `Sustainable Allocation: Current load is ${validation?.percentage.toFixed(1)}%.`
+                )}
+              </div>
             </div>
           </div>
 
-          <div className="flex justify-end gap-3">
+          <div className="flex justify-end gap-4 pt-4 border-t border-slate-100">
             <Button
               variant="ghost"
-              disabled={!selectedSpecialist || !isOverloaded}
+              disabled={!selectedSpecialist || validation?.valid === true}
               onClick={() => setIsOverrideOpen(true)}
+              className="text-slate-500 hover:text-primary"
             >
               Request Override
             </Button>
             <Button
-              disabled={!selectedTask || !selectedSpecialist || isOverloaded}
+              disabled={!selectedTask || !selectedSpecialist || (validation && !validation.valid)}
+              onClick={() => handleSave()}
+              className="px-6 shadow-sm"
             >
-              Save Allocation
+              {isSaving ? 'Saving...' : 'Save Allocation'}
             </Button>
           </div>
         </div>
@@ -93,7 +164,8 @@ export const AllocationInterface = () => {
       <OverrideModal
         isOpen={isOverrideOpen}
         onClose={() => setIsOverrideOpen(false)}
-        specialistName={currentSpecialist?.name || 'Unknown'}
+        specialistName={specialists.find(s => s.id.toString() === selectedSpecialist)?.name || 'Unknown'}
+        onConfirm={(data) => handleSave(data)}
       />
     </>
   );

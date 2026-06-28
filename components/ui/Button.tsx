@@ -6,6 +6,7 @@ type ButtonProps = {
   className?: string;
   variant?: 'primary' | 'ghost' | 'outline';
   disabled?: boolean;
+  ariaLabel?: string;
 };
 
 export const Button = ({
@@ -13,7 +14,8 @@ export const Button = ({
   onClick,
   className = '',
   variant = 'primary',
-  disabled = false
+  disabled = false,
+  ariaLabel
 }: ButtonProps) => {
   const baseStyles = "px-4 py-2 rounded-interactive font-medium transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed";
 
@@ -27,6 +29,7 @@ export const Button = ({
     <button
       onClick={onClick}
       disabled={disabled}
+      aria-label={ariaLabel || (typeof children === 'string' ? children : undefined)}
       className={`${baseStyles} ${variants[variant]} ${className}`}
     >
       {children}
