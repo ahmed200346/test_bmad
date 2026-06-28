@@ -2,8 +2,10 @@
 
 import db from '@/lib/db';
 import { revalidatePath } from 'next/cache';
+import { calculateSpecialistCapacity } from './capacity';
 
 export type Specialist = {
+// ... (existing type)
   id: number;
   name: string;
   skillTags: string[];
@@ -13,7 +15,7 @@ export type Specialist = {
 };
 
 export async function getSpecialists() {
-  const rows = db.prepare('SELECT * FROM specialists').all();
+  const rows = db.prepare('SELECT * FROM specialists').all() as any[];
   return rows.map(row => ({
     ...row,
     skillTags: JSON.parse(row.skillTags || '[]'),
@@ -60,4 +62,35 @@ export async function deactivateSpecialist(id: number) {
   db.prepare('UPDATE specialists SET isActive = 0 WHERE id = ?').run(id);
   revalidatePath('/dashboard');
   revalidatePath('/specialists');
+}
+
+export async function getFilteredSpecialists(filters: {
+  skills: string[];
+  seniority: string | null;
+  availableOnly: boolean;
+  windowStart: string;
+  windowEnd: string;
+}) {
+  const all = await getSpecialists();
+
+  const filteredByStatic = all.filter(s => {
+    if (filters.seniority && s.seniority !== filters.seniority) return false;
+    if (filters.skills.length > 0) {
+      if (!filters.skills.every(skill => s.skillTags.includes(skill))) return false;
+    }
+    return true;
+  });
+
+  if (!filters.availableOnly) {
+    return filteredByStatic;
+  }
+
+  const available = await Promise.all(
+    filteredByStatic.map(async (s) => {
+      const load = await calculateSpecialistCapacity(s.id, filters.windowStart, filters.windowEnd);
+      return load < s.availabilityHoursPerWeek ? s : null;
+    })
+  );
+
+  return available.filter((s): s is Specialist => s !== null);
 }

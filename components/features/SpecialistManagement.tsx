@@ -4,21 +4,40 @@ import React, { useState } from 'react';
 import { Card } from '../ui/Card';
 import { Button } from '../ui/Button';
 import { Modal } from '../ui/Modal';
-import { getSpecialists, createSpecialist, updateSpecialist, deactivateSpecialist, Specialist } from '@/app/actions/specialists';
+import { getSpecialists, createSpecialist, updateSpecialist, deactivateSpecialist, getFilteredSpecialists, Specialist } from '@/app/actions/specialists';
 
 export const SpecialistManagement = () => {
   const [specialists, setSpecialists] = useState<Specialist[]>([]);
   const [isCreateOpen, setIsCreateOpen] = useState(false);
   const [editingSpecialist, setEditingSpecialist] = useState<Specialist | null>(null);
 
+  const [filters, setFilters] = useState({
+    seniority: '',
+    skills: '',
+    availableOnly: false,
+    windowStart: new Date().toISOString().split('T')[0],
+    windowEnd: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0]
+  });
+
   const loadSpecialists = async () => {
-    const data = await getSpecialists();
+    let data;
+    if (filters.seniority || filters.skills || filters.availableOnly) {
+      data = await getFilteredSpecialists({
+        skills: filters.skills ? filters.skills.split(',').map(s => s.trim()) : [],
+        seniority: filters.seniority || null,
+        availableOnly: filters.availableOnly,
+        windowStart: filters.windowStart,
+        windowEnd: filters.windowEnd
+      });
+    } else {
+      data = await getSpecialists();
+    }
     setSpecialists(data);
   };
 
   React.useEffect(() => {
     loadSpecialists();
-  }, []);
+  }, [filters]);
 
   const handleCreate = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
@@ -60,6 +79,50 @@ export const SpecialistManagement = () => {
       <div className="flex justify-between items-center">
         <h2 className="text-xl font-semibold text-slate-900">Specialist Inventory</h2>
         <Button onClick={() => setIsCreateOpen(true)}>Add Specialist</Button>
+      </div>
+
+      <div className="bg-white p-4 rounded-interactive border border-slate-200 flex flex-wrap gap-4 items-end">
+        <div className="flex flex-col gap-1">
+          <label className="text-[10px] font-bold text-slate-400 uppercase">Seniority</label>
+          <select
+            value={filters.seniority}
+            onChange={e => setFilters({...filters, seniority: e.target.value})}
+            className="p-2 text-xs border border-slate-200 rounded-interactive"
+          >
+            <option value="">All</option>
+            <option value="Junior">Junior</option>
+            <option value="Mid">Mid</option>
+            <option value="Senior">Senior</option>
+            <option value="Staff">Staff</option>
+          </select>
+        </div>
+        <div className="flex flex-col gap-1">
+          <label className="text-[10px] font-bold text-slate-400 uppercase">Skills</label>
+          <input
+            type="text"
+            placeholder="e.g. TypeScript, React"
+            value={filters.skills}
+            onChange={e => setFilters({...filters, skills: e.target.value})}
+            className="p-2 text-xs border border-slate-200 rounded-interactive"
+          />
+        </div>
+        <div className="flex items-center gap-2 h-10">
+          <input
+            type="checkbox"
+            id="availableOnly"
+            checked={filters.availableOnly}
+            onChange={e => setFilters({...filters, availableOnly: e.target.checked})}
+            className="rounded border-slate-300"
+          />
+          <label htmlFor="availableOnly" className="text-xs font-medium text-slate-600">Available Only</label>
+        </div>
+        <Button variant="ghost" className="text-xs h-10" onClick={() => setFilters({
+          seniority: '',
+          skills: '',
+          availableOnly: false,
+          windowStart: new Date().toISOString().split('T')[0],
+          windowEnd: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0]
+        })}>Reset</Button>
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-gap">
