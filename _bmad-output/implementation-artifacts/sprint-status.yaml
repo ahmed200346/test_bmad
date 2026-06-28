@@ -49,9 +49,9 @@ story_location: /home/sigma/Desktop/bmad_test/test_bmad/_bmad-output/implementat
 
 development_status:
   epic-1: backlog
-  1-1-specialist-profile-management: backlog
-  1-2-task-definition-duration-validation: backlog
-  1-3-task-dependency-linking-dag: backlog
+  1-1-specialist-profile-management: done
+  1-2-task-definition-duration-validation: done
+  1-3-task-dependency-linking-dag: done
   1-4-basic-resource-filtering: backlog
   epic-1-retrospective: optional
   epic-2: backlog
