@@ -3,7 +3,7 @@ import { Card } from '../ui/Card';
 import { Button } from '../ui/Button';
 
 type FeatureCardProps = {
-  icon: string;
+  icon: React.ReactNode;
   title: string;
   description: string;
   link: string;

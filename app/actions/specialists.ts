@@ -14,13 +14,55 @@ export type Specialist = {
   isActive: boolean;
 };
 
+<<<<<<< HEAD
 export async function getSpecialists() {
   const rows = db.prepare('SELECT * FROM specialists').all() as any[];
   return rows.map(row => ({
+=======
+export async function getSpecialists(filters?: {
+  skill?: string;
+  seniority?: string;
+  onlyAvailable?: boolean;
+}) {
+  let query = 'SELECT * FROM specialists WHERE 1=1';
+  const params: any[] = [];
+
+  if (filters?.seniority) {
+    query += ' AND seniority = ?';
+    params.push(filters.seniority);
+  }
+
+  if (!filters?.onlyAvailable === false) {
+    // If onlyAvailable is true, we need to check their current load
+    // For simplicity in this phase, we'll filter by isActive first,
+    // and then we would normally join with the allocations table to check load.
+  }
+
+  // isActive is a base requirement for "Available" in Story 1.4
+  if (filters?.onlyAvailable) {
+    query += ' AND isActive = 1';
+    // In a full implementation, this would also join with the allocations table
+    // to ensure sum(hours) < availabilityHoursPerWeek for the current window.
+  }
+
+  const rows = db.prepare(query).all(...params);
+
+  let specialists = rows.map(row => ({
+>>>>>>> bee5cf50f980be97591ae90a1978ef89969a47b2
     ...row,
     skillTags: JSON.parse(row.skillTags || '[]'),
     isActive: !!row.isActive
   })) as Specialist[];
+
+  // Client-side filtering for skillTags since it's stored as JSON in SQLite
+  if (filters?.skill) {
+    const searchSkill = filters.skill.toLowerCase();
+    specialists = specialists.filter(s =>
+      s.skillTags.some(tag => tag.toLowerCase().includes(searchSkill))
+    );
+  }
+
+  return specialists;
 }
 
 export async function createSpecialist(data: Omit<Specialist, 'id'>) {

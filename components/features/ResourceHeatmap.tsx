@@ -1,29 +1,50 @@
 'use client';
 
-import React from 'react';
+import React, { useState, useEffect } from 'react';
 import { Card } from '../ui/Card';
 import { HeatmapCell } from './HeatmapCell';
+import { getHeatmapData } from '@/app/actions/heatmap';
 
 type HeatmapData = {
   specialist: string;
-  load: number; // 0 to 100+
+  load: number;
+  hours: number;
+  capacity: number;
 };
 
-const MOCK_DATA: HeatmapData[] = [
-  { specialist: "Marcus (Senior Dev)", load: 75 },
-  { specialist: "Sarah (Architect)", load: 90 },
-  { specialist: "Elena (Frontend)", load: 110 },
-  { specialist: "James (DevOps)", load: 40 },
-  { specialist: "Maya (Product)", load: 65 },
-  { specialist: "Kael (Backend)", load: 120 },
-];
-
 export const ResourceHeatmap = () => {
+  const [data, setData] = useState<HeatmapData[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  const loadData = async () => {
+    setLoading(true);
+    try {
+      const res = await getHeatmapData();
+      setData(res);
+    } catch (e) {
+      console.error("Failed to load heatmap data", e);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    loadData();
+  }, []);
+
+  if (loading) {
+    return (
+      <Card className="w-full h-48 flex items-center justify-center text-slate-400 italic">
+        Loading capacity data...
+      </Card>
+    );
+  }
+
   return (
-    <Card className="w-full">
-      <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
-        {MOCK_DATA.map((item, i) => (
-          <HeatmapCell key={i} specialist={item.specialist} load={item.load} />
+    <Card className="w-full border-none shadow-sm bg-white/50 backdrop-blur-sm">
+      <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-gap">
+        {data.map((item, i) => (
+          <HeatmapCell key={i} {...item} />
         ))}
       </div >
     </Card>
