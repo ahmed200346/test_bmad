@@ -10,11 +10,6 @@ export const SpecialistManagement = () => {
   const [specialists, setSpecialists] = useState<Specialist[]>([]);
   const [isCreateOpen, setIsCreateOpen] = useState(false);
   const [editingSpecialist, setEditingSpecialist] = useState<Specialist | null>(null);
-  const [filters, setFilters] = useState({
-    skill: '',
-    seniority: '',
-    onlyAvailable: false,
-  });
 
   const [filters, setFilters] = useState({
     seniority: '',
@@ -25,7 +20,6 @@ export const SpecialistManagement = () => {
   });
 
   const loadSpecialists = async () => {
-<<<<<<< HEAD
     let data;
     if (filters.seniority || filters.skills || filters.availableOnly) {
       data = await getFilteredSpecialists({
@@ -38,9 +32,6 @@ export const SpecialistManagement = () => {
     } else {
       data = await getSpecialists();
     }
-=======
-    const data = await getSpecialists(filters);
->>>>>>> bee5cf50f980be97591ae90a1978ef89969a47b2
     setSpecialists(data);
   };
 
@@ -93,59 +84,14 @@ export const SpecialistManagement = () => {
         <Button onClick={() => setIsCreateOpen(true)}>Add Specialist</Button>
       </div>
 
-<<<<<<< HEAD
-      <div className="bg-white p-4 rounded-interactive border border-slate-200 flex flex-wrap gap-4 items-end">
-        <div className="flex flex-col gap-1">
-          <label className="text-[10px] font-bold text-slate-400 uppercase">Seniority</label>
-          <select
-            value={filters.seniority}
-            onChange={e => setFilters({...filters, seniority: e.target.value})}
-            className="p-2 text-xs border border-slate-200 rounded-interactive"
-          >
-            <option value="">All</option>
-            <option value="Junior">Junior</option>
-            <option value="Mid">Mid</option>
-            <option value="Senior">Senior</option>
-            <option value="Staff">Staff</option>
-          </select>
-        </div>
-        <div className="flex flex-col gap-1">
-          <label className="text-[10px] font-bold text-slate-400 uppercase">Skills</label>
-          <input
-            type="text"
-            placeholder="e.g. TypeScript, React"
-            value={filters.skills}
-            onChange={e => setFilters({...filters, skills: e.target.value})}
-            className="p-2 text-xs border border-slate-200 rounded-interactive"
-          />
-        </div>
-        <div className="flex items-center gap-2 h-10">
-          <input
-            type="checkbox"
-            id="availableOnly"
-            checked={filters.availableOnly}
-            onChange={e => setFilters({...filters, availableOnly: e.target.checked})}
-            className="rounded border-slate-300"
-          />
-          <label htmlFor="availableOnly" className="text-xs font-medium text-slate-600">Available Only</label>
-        </div>
-        <Button variant="ghost" className="text-xs h-10" onClick={() => setFilters({
-          seniority: '',
-          skills: '',
-          availableOnly: false,
-          windowStart: new Date().toISOString().split('T')[0],
-          windowEnd: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0]
-        })}>Reset</Button>
-      </div>
-=======
       {/* Filter Bar - Calm Productivity style */}
       <Card className="p-4 border-none shadow-sm bg-white/50 backdrop-blur-sm">
         <div className="flex flex-col md:flex-row gap-4 items-center">
           <div className="flex flex-col gap-1 w-full md:w-auto">
             <label className="text-[10px] font-bold uppercase tracking-widest text-slate-400">Skill Search</label>
             <input
-              value={filters.skill}
-              onChange={(e) => setFilters(f => ({ ...f, skill: e.target.value }))}
+              value={filters.skills}
+              onChange={(e) => setFilters(f => ({ ...f, skills: e.target.value }))}
               placeholder="e.g. TypeScript, React..."
               className="p-2 text-sm border border-slate-200 rounded-interactive bg-white focus:ring-2 focus:ring-primary outline-none transition-all"
             />
@@ -168,17 +114,23 @@ export const SpecialistManagement = () => {
             <input
               type="checkbox"
               id="avail-filter"
-              checked={filters.onlyAvailable}
-              onChange={(e) => setFilters(f => ({ ...f, onlyAvailable: e.target.checked }))}
+              checked={filters.availableOnly}
+              onChange={(e) => setFilters(f => ({ ...f, availableOnly: e.target.checked }))}
               className="w-4 h-4 rounded border-slate-300 text-primary focus:ring-primary"
             />
             <label htmlFor="avail-filter" className="text-sm font-medium text-slate-600 cursor-pointer">
               Show Available Only
             </label>
           </div>
-        </div
+          <Button variant="ghost" className="text-xs h-10" onClick={() => setFilters({
+            seniority: '',
+            skills: '',
+            availableOnly: false,
+            windowStart: new Date().toISOString().split('T')[0],
+            windowEnd: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0]
+          })}>Reset</Button>
+        </div>
       </Card>
->>>>>>> bee5cf50f980be97591ae90a1978ef89969a47b2
 
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-gap">
         {specialists.length === 0 ? (

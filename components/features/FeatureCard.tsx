@@ -6,10 +6,9 @@ type FeatureCardProps = {
   icon: React.ReactNode;
   title: string;
   description: string;
-  link: string;
 };
 
-export const FeatureCard = ({ icon, title, description, link }: FeatureCardProps) => {
+export const FeatureCard = ({ icon, title, description }: FeatureCardProps) => {
   return (
     <Card className="flex flex-col h-full group hover:border-primary transition-colors">
       <div className="text-3xl mb-4 group-hover:scale-110 transition-transform duration-200">
