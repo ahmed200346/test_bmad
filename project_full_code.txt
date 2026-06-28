@@ -1,0 +1,2128 @@
+--- FILE: app/actions/capacity.ts ---
+'use server';
+
+import db from '@/lib/db';
+
+export async function calculateSpecialistCapacity(specialistId: number, windowStart: string, windowEnd: string): Promise<number> {
+  const stmt = db.prepare(
+    'SELECT SUM(hours) as total FROM allocations WHERE specialistId = ? AND windowStart >= ? AND windowEnd <= ?'
+  );
+  const result = stmt.get(specialistId, windowStart, windowEnd) as { total: number | null };
+  return result.total || 0;
+}
+
+export async function getSpecialistHourlyLoad(specialistId: number) {
+  const rows = db.prepare(
+    'SELECT a.windowStart, a.hours, t.name as taskName FROM allocations a JOIN tasks t ON a.taskId = t.id WHERE a.specialistId = ? ORDER BY a.windowStart ASC',
+    [specialistId]
+  ).all() as any[];
+
+  return rows;
+}
+\n
+--- FILE: app/actions/engine.ts ---
+'use server';
+
+import db from '@/lib/db';
+import { revalidatePath } from 'next/cache';
+
+export type AllocationRequest = {
+  specialistId: number;
+  taskId: number;
+  hours: number;
+  windowStart: string;
+  windowEnd: string;
+};
+
+export async function calculateSpecialistLoad(specialistId: number, windowStart: string, windowEnd: string) {
+  const row = db.prepare(`
+    SELECT SUM(hours) as totalHours
+    FROM allocations
+    WHERE specialistId = ?
+    AND windowStart >= ?
+    AND windowEnd <= ?
+  `).get(specialistId, windowStart, windowEnd) as { totalHours: number | null };
+
+  return row.totalHours || 0;
+}
+
+export async function validateAllocation(request: AllocationRequest) {
+  const specialist = db.prepare('SELECT * FROM specialists WHERE id = ?').get(request.specialistId) as any;
+  if (!specialist) throw new Error("Specialist not found.");
+  if (!specialist.isActive) throw new Error("Specialist is currently inactive.");
+
+  const currentLoad = await calculateSpecialistLoad(request.specialistId, request.windowStart, request.windowEnd);
+  const totalHours = currentLoad + request.hours;
+  const capacityPercentage = (totalHours / specialist.availabilityHoursPerWeek) * 100;
+
+  if (capacityPercentage > 100) {
+    return {
+      valid: false,
+      error: `Capacity Exceeded: This assignment would push the specialist to ${capacityPercentage.toFixed(1)}%.`,
+      percentage: capacityPercentage
+    };
+  }
+
+  // Story 2.3: Recovery Floor Enforcement
+  // Check if this is a high-intensity task (> 8h)
+  if (request.hours > 8) {
+    const lastIntensiveTask = db.prepare(`
+      SELECT a.windowEnd
+      FROM allocations a
+      JOIN tasks t ON a.taskId = t.id
+      WHERE a.specialistId = ? AND t.duration > 8
+      ORDER BY a.windowEnd DESC LIMIT 1
+    `).get(request.specialistId) as { windowEnd: string | null };
+
+    if (lastIntensiveTask?.windowEnd) {
+      const end = new Date(lastIntensiveTask.windowEnd).getTime();
+      const start = new Date(request.windowStart).getTime();
+      const diffHours = (start - end) / (1000 * 60 * 60);
+
+      if (diffHours < 24) {
+        return {
+          valid: false,
+          error: "Recovery Floor Violation: Specialist requires a minimum recharge period (24h) after intensive tasks.",
+          percentage: capacityPercentage
+        };
+      }
+    }
+  }
+
+  return { valid: true, percentage: capacityPercentage };
+}
+
+export async function allocateTask(request: AllocationRequest, override?: { priority: string; rationale: string }) {
+  const validation = await validateAllocation(request);
+
+  if (!validation.valid && !override) {
+    throw new Error(validation.error);
+  }
+
+  const stmt = db.prepare(
+    'INSERT INTO allocations (specialistId, taskId, hours, windowStart, windowEnd) VALUES (?, ?, ?, ?, ?)'
+  );
+  const info = stmt.run(request.specialistId, request.taskId, request.hours, request.windowStart, request.windowEnd);
+  const allocationId = info.lastInsertRowid;
+
+  if (override) {
+    const debtHours = (validation.percentage || 0) > 100
+      ? (validation.percentage || 0) - 100
+      : 0;
+
+    db.prepare(`
+      INSERT INTO capacity_debt (allocationId, priority, rationale, excessHours)
+      VALUES (?, ?, ?, ?)
+    `).run(allocationId, override.priority, override.rationale, debtHours);
+  }
+
+  revalidatePath('/dashboard');
+  revalidatePath('/allocate');
+  return allocationId;
+}
+\n
+--- FILE: app/actions/heatmap.ts ---
+'use server';
+
+import db from '@/lib/db';
+import { revalidatePath } from 'next/cache';
+
+export async function getHeatmapData() {
+  // Window: Current Week (Demo)
+  const today = new Date().toISOString().split('T')[0];
+  const nextWeek = new Date();
+  nextWeek.setDate(nextWeek.getDate() + 7);
+  const end = nextWeek.toISOString().split('T')[0];
+
+  const specialists = db.prepare('SELECT * FROM specialists WHERE isActive = 1').all() as any[];
+
+  return specialists.map(s => {
+    const load = db.prepare(`
+      SELECT SUM(hours) as total
+      FROM allocations
+      WHERE specialistId = ?
+      AND windowStart >= ?
+      AND windowEnd <= ?
+    `).get(s.id, today, end) as { total: number | null };
+
+    const totalHours = load.total || 0;
+    const percentage = (totalHours / s.availabilityHoursPerWeek) * 100;
+
+    return {
+      specialist: s.name,
+      load: Math.round(percentage),
+      hours: totalHours,
+      capacity: s.availabilityHoursPerWeek
+    };
+  });
+}
+\n
+--- FILE: app/actions/risks.ts ---
+'use server';
+
+import db from '@/lib/db';
+
+export type Risk = {
+  id: number;
+  type: 'Slippage' | 'Constraint';
+  title: string;
+  severity: 'success' | 'warning' | 'critical';
+  desc: string;
+};
+
+export async function getScheduleRisks() {
+  const risks: Risk[] = [];
+
+  // Detect Slippage: Task A -> Task B where A.endDate > B.startDate
+  const slippages = db.prepare(`
+    SELECT
+      t2.id,
+      t2.name as title,
+      t1.name as parentName,
+      t1.endDate as parentEnd,
+      t2.startDate as childStart
+    FROM dependencies d
+    JOIN tasks t1 ON d.parentTaskId = t1.id
+    JOIN tasks t2 ON d.childTaskId = t2.id
+    WHERE t1.endDate > t2.startDate
+  `).all() as any[];
+
+  slippages.forEach(s => {
+    risks.push({
+      id: s.id,
+      type: 'Slippage',
+      title: s.title,
+      severity: 'critical',
+      desc: `Prerequisite ${s.parentName} ends on ${s.parentEnd}, which is after this task starts on ${s.childStart}.`
+    });
+  });
+
+  // Detect Constraints: Over-allocated specialists
+  const overloads = db.prepare(`
+    SELECT s.id, s.name as title,
+    (SELECT SUM(hours) FROM allocations WHERE specialistId = s.id) as totalHours,
+    s.availabilityHoursPerWeek as capacity
+    FROM specialists s
+    WHERE s.isActive = 1
+  `).all() as any[];
+
+  overloads.forEach(o => {
+    const load = (o.totalHours || 0);
+    if (load > o.capacity) {
+      risks.push({
+        id: o.id,
+        type: 'Constraint',
+        title: o.title,
+        severity: 'warning',
+        desc: `Load is ${((load / o.capacity) * 100).toFixed(1)}% (${load}h / ${o.capacity}h).`
+      });
+    }
+  });
+
+  return risks;
+}
+\n
+--- FILE: app/actions/specialists.ts ---
+'use server';
+
+import db from '@/lib/db';
+import { revalidatePath } from 'next/cache';
+import { calculateSpecialistCapacity } from './capacity';
+
+export type Specialist = {
+// ... (existing type)
+  id: number;
+  name: string;
+  skillTags: string[];
+  seniority: 'Junior' | 'Mid' | 'Senior' | 'Staff';
+  availabilityHoursPerWeek: number;
+  isActive: boolean;
+};
+
+<<<<<<< HEAD
+export async function getSpecialists() {
+  const rows = db.prepare('SELECT * FROM specialists').all() as any[];
+  return rows.map(row => ({
+=======
+export async function getSpecialists(filters?: {
+  skill?: string;
+  seniority?: string;
+  onlyAvailable?: boolean;
+}) {
+  let query = 'SELECT * FROM specialists WHERE 1=1';
+  const params: any[] = [];
+
+  if (filters?.seniority) {
+    query += ' AND seniority = ?';
+    params.push(filters.seniority);
+  }
+
+  if (!filters?.onlyAvailable === false) {
+    // If onlyAvailable is true, we need to check their current load
+    // For simplicity in this phase, we'll filter by isActive first,
+    // and then we would normally join with the allocations table to check load.
+  }
+
+  // isActive is a base requirement for "Available" in Story 1.4
+  if (filters?.onlyAvailable) {
+    query += ' AND isActive = 1';
+    // In a full implementation, this would also join with the allocations table
+    // to ensure sum(hours) < availabilityHoursPerWeek for the current window.
+  }
+
+  const rows = db.prepare(query).all(...params);
+
+  let specialists = rows.map(row => ({
+>>>>>>> bee5cf50f980be97591ae90a1978ef89969a47b2
+    ...row,
+    skillTags: JSON.parse(row.skillTags || '[]'),
+    isActive: !!row.isActive
+  })) as Specialist[];
+
+  // Client-side filtering for skillTags since it's stored as JSON in SQLite
+  if (filters?.skill) {
+    const searchSkill = filters.skill.toLowerCase();
+    specialists = specialists.filter(s =>
+      s.skillTags.some(tag => tag.toLowerCase().includes(searchSkill))
+    );
+  }
+
+  return specialists;
+}
+
+import { secureAction } from '@/lib/secure-action';
+
+export async function createSpecialist(token: string | undefined, data: Omit<Specialist, 'id'>) {
+  return secureAction(token, 'PM', 'createSpecialist', async () => {
+    const stmt = db.prepare(
+      'INSERT INTO specialists (name, skillTags, seniority, availabilityHoursPerWeek, isActive) VALUES (?, ?, ?, ?, ?)'
+    );
+    const info = stmt.run(
+      data.name,
+      JSON.stringify(data.skillTags),
+      data.seniority,
+      data.availabilityHoursPerWeek,
+      data.isActive ? 1 : 0
+    );
+    revalidatePath('/dashboard');
+    revalidatePath('/specialists');
+    return info.lastInsertRowid;
+  });
+}
+
+export async function updateSpecialist(id: number, data: Partial<Specialist>) {
+  const updates: string[] = [];
+  const params: any[] = [];
+
+  if (data.name !== undefined) { updates.push('name = ?'); params.push(data.name); }
+  if (data.skillTags !== undefined) { updates.push('skillTags = ?'); params.push(JSON.stringify(data.skillTags)); }
+  if (data.seniority !== undefined) { updates.push('seniority = ?'); params.push(data.seniority); }
+  if (data.availabilityHoursPerWeek !== undefined) { updates.push('availabilityHoursPerWeek = ?'); params.push(data.availabilityHoursPerWeek); }
+  if (data.isActive !== undefined) { updates.push('isActive = ?'); params.push(data.isActive ? 1 : 0); }
+
+  if (updates.length === 0) return;
+
+  params.push(id);
+  const stmt = db.prepare(`UPDATE specialists SET ${updates.join(', ')} WHERE id = ?`);
+  stmt.run(...params);
+  revalidatePath('/dashboard');
+  revalidatePath('/specialists');
+}
+
+export async function deactivateSpecialist(id: number) {
+  db.prepare('UPDATE specialists SET isActive = 0 WHERE id = ?').run(id);
+  revalidatePath('/dashboard');
+  revalidatePath('/specialists');
+}
+
+export async function getFilteredSpecialists(filters: {
+  skills: string[];
+  seniority: string | null;
+  availableOnly: boolean;
+  windowStart: string;
+  windowEnd: string;
+}) {
+  const all = await getSpecialists();
+
+  const filteredByStatic = all.filter(s => {
+    if (filters.seniority && s.seniority !== filters.seniority) return false;
+    if (filters.skills.length > 0) {
+      if (!filters.skills.every(skill => s.skillTags.includes(skill))) return false;
+    }
+    return true;
+  });
+
+  if (!filters.availableOnly) {
+    return filteredByStatic;
+  }
+
+  const available = await Promise.all(
+    filteredByStatic.map(async (s) => {
+      const load = await calculateSpecialistCapacity(s.id, filters.windowStart, filters.windowEnd);
+      return load < s.availabilityHoursPerWeek ? s : null;
+    })
+  );
+
+  return available.filter((s): s is Specialist => s !== null);
+}
+\n
+--- FILE: app/actions/tasks.ts ---
+'use server';
+
+import db from '@/lib/db';
+import { revalidatePath } from 'next/cache';
+
+export type Task = {
+  id: number;
+  name: string;
+  duration: number;
+  startDate: string | null;
+  endDate: string | null;
+  status: string;
+  isBlocked: boolean;
+};
+
+export async function getTasks() {
+  const rows = db.prepare('SELECT * FROM tasks').all() as any[];
+
+  return Promise.all(rows.map(async (row) => {
+    const prerequisites = db.prepare('SELECT parentTaskId FROM dependencies WHERE childTaskId = ?').all(row.id) as { parentTaskId: number }[];
+
+    let isBlocked = false;
+    for (const { parentTaskId } of prerequisites) {
+      const parent = db.prepare('SELECT status FROM tasks WHERE id = ?').get(parentTaskId) as { status: string } | undefined;
+      if (!parent || parent.status !== 'Complete') {
+        isBlocked = true;
+        break;
+      }
+    }
+
+    return {
+      ...row,
+      isBlocked
+    };
+  })) as Promise<Task[]>;
+}
+
+export async function createTask(data: { name: string; duration: number; startDate?: string; endDate?: string }) {
+  if (data.duration < 0.25) {
+    throw new Error("Task duration must be at least 0.25 hours.");
+  }
+
+  const stmt = db.prepare(
+    'INSERT INTO tasks (name, duration, startDate, endDate) VALUES (?, ?, ?, ?)'
+  );
+  const info = stmt.run(data.name, data.duration, data.startDate || null, data.endDate || null);
+  revalidatePath('/dashboard');
+  return info.lastInsertRowid;
+}
+
+export async function updateTask(id: number, data: Partial<Task>) {
+  const updates: string[] = [];
+  const params: any[] = [];
+
+  if (data.name !== undefined) { updates.push('name = ?'); params.push(data.name); }
+  if (data.duration !== undefined) {
+    if (data.duration < 0.25) throw new Error("Task duration must be at least 0.25 hours.");
+    updates.push('duration = ?');
+    params.push(data.duration);
+  }
+  if (data.startDate !== undefined) { updates.push('startDate = ?'); params.push(data.startDate); }
+  if (data.endDate !== undefined) { updates.push('endDate = ?'); params.push(data.endDate); }
+  if (data.status !== undefined) { updates.push('status = ?'); params.push(data.status); }
+
+  if (updates.length === 0) return;
+
+  params.push(id);
+  const stmt = db.prepare(`UPDATE tasks SET ${updates.join(', ')} WHERE id = ?`);
+  stmt.run(...params);
+  revalidatePath('/dashboard');
+}
+
+export async function addDependency(parentTaskId: number, childTaskId: number) {
+  if (parentTaskId === childTaskId) {
+    throw new Error("A task cannot depend on itself.");
+  }
+
+  // Circular Dependency Detection (DFS)
+  const visited = new Set<number>();
+  const recStack = new Set<number>();
+
+  function hasCycle(u: number): boolean {
+    visited.add(u);
+    recStack.add(u);
+
+    const deps = db.prepare('SELECT childTaskId FROM dependencies WHERE parentTaskId = ?').all(u) as { childTaskId: number }[];
+    for (const { childTaskId } of deps) {
+      if (!visited.has(childTaskId)) {
+        if (hasCycle(childTaskId)) return true;
+      } else if (recStack.has(childTaskId)) {
+        return true;
+      }
+    }
+
+    recStack.delete(u);
+    return false;
+  }
+
+  // Temporarily add the dependency to check for cycle
+  db.prepare('INSERT INTO dependencies (parentTaskId, childTaskId) VALUES (?, ?)').run(parentTaskId, childTaskId);
+
+  const cycle = hasCycle(parentTaskId);
+
+  if (cycle) {
+    db.prepare('DELETE FROM dependencies WHERE parentTaskId = ? AND childTaskId = ?').run(parentTaskId, childTaskId);
+    throw new Error("Circular dependencies are not permitted.");
+  }
+
+  revalidatePath('/dashboard');
+}
+
+export async function removeDependency(parentTaskId: number, childTaskId: number) {
+  db.prepare('DELETE FROM dependencies WHERE parentTaskId = ? AND childTaskId = ?').run(parentTaskId, childTaskId);
+  revalidatePath('/dashboard');
+}
+\n
+--- FILE: app/allocate/page.tsx ---
+import { Navbar } from '@/components/layout/Navbar';
+import { PageHeader } from '@/components/layout/PageHeader';
+import { AllocationInterface } from '@/components/features/AllocationInterface';
+
+export default function AllocatePage() {
+  return (
+    <div className="min-h-screen flex flex-col bg-secondary">
+      <Navbar />
+
+      <main className="flex-grow max-w-4xl mx-auto px-6 py-12 w-full">
+        <PageHeader
+          title="Task Allocation"
+          subtitle="Map tasks to specialists while maintaining sustainable capacity."
+        />
+        <div className="mt-8">
+          <AllocationInterface />
+        </div>
+      </main>
+    </div>
+  );
+}
+\n
+--- FILE: app/dashboard/page.tsx ---
+import { Navbar } from '@/components/layout/Navbar';
+import { PageHeader } from '@/components/layout/PageHeader';
+import { ResourceHeatmap } from '@/components/features/ResourceHeatmap';
+import { RiskPanel } from '@/components/features/RiskPanel';
+import { Button } from '@/components/ui/Button';
+
+export default function DashboardPage() {
+  return (
+    <div className="min-h-screen flex flex-col bg-secondary">
+      <Navbar />
+
+      <main className="flex-grow max-w-7xl mx-auto px-6 py-12 w-full">
+        <PageHeader
+          title="Resource Dashboard"
+          subtitle="Real-time utilization and risk overview"
+        >
+          <div className="flex gap-3">
+            <Button variant="outline">Export Report</Button>
+            <Button>Add Resource</Button>
+          </div>
+        </PageHeader>
+
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-gap">
+          <div className="lg:col-span-2">
+            <div className="mb-4 flex items-center justify-between">
+              <h3 className="text-sm font-medium text-slate-500 uppercase tracking-widest">Capacity Heatmap</h3>
+              <span className="text-xs text-slate-400">Window: Current Week</span>
+            </div>
+            <ResourceHeatmap />
+          </div>
+          <div className="lg:col-span-1">
+            <div className="mb-4 flex items-center justify-between">
+              <h3 className="text-sm font-medium text-slate-500 uppercase tracking-widest">Active Risks</h3>
+            </div>
+            <RiskPanel />
+          </div>
+        </div>
+      </main>
+    </div>
+  );
+}
+\n
+--- FILE: app/layout.tsx ---
+import type { Metadata } from "next";
+import { Inter } from "next/font/google";
+import "./globals.css";
+import { initDb } from "@/lib/db";
+
+const inter = Inter({
+  variable: "--font-inter",
+  subsets: ["latin"],
+});
+
+export const metadata: Metadata = {
+  title: "OptiTask Resource Orchestrator",
+  description: "Sustainable Resource Allocation and Constraint Management",
+};
+
+export default function RootLayout({
+  children,
+}: Readonly<{
+  children: React.ReactNode;
+}>) {
+  initDb();
+  return (
+    <html
+      lang="en"
+      className={`${inter.variable} h-full antialiased`}
+    >
+      <body className="min-h-full flex flex-col">{children}</body>
+    </html>
+  );
+}
+\n
+--- FILE: app/page.tsx ---
+'use client';
+
+import React from 'react';
+import { Navbar } from '@/components/layout/Navbar';
+import { FeatureCard } from '@/components/features/FeatureCard';
+
+// Custom SVG Icons to avoid dependency issues and ensure "line-art" style
+const Icons = {
+  Users: () => (
+    <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="w-8 h-8 text-primary">
+      <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
+      <circle cx="9" cy="7" r="4" />
+      <path d="M22 21v-2a4 4 0 0 0-3-4H11a4 4 0 0 0-4 4v2" />
+      <circle cx="16" cy="7" r="4" />
+    </svg>
+  ),
+  Network: () => (
+    <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="w-8 h-8 text-primary">
+      <circle cx="12" cy="12" r="3" />
+      <circle cx="3" cy="3" r="2" />
+      <circle cx="21" cy="3" r="2" />
+      <circle cx="3" cy="21" r="2" />
+      <circle cx="21" cy="21" r="2" />
+      <path d="M12 9V3" />
+      <path d="M12 15v6" />
+      <path d="M9 12H3" />
+      <path d="M15 12h6" />
+    </svg>
+  ),
+  Scale: () => (
+    <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="w-8 h-8 text-primary">
+      <path d="M3 6h18" />
+      <path d="M12 6v16" />
+      <path d="M8 10a2 2 0 0 0-2 2v4a2 2 0 0 0 2 2h4a2 2 0 0 0 2-2v-4a2 2 0 0 0-2-2h-4z" />
+      <path d="M16 10a2 2 0 0 0-2 2v4a2 2 0 0 0 2 2h4a2 2 0 0 0 2-2v-4a2 2 0 0 0-2-2h-4z" />
+    </svg>
+  ),
+  Battery: () => (
+    <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="w-8 h-8 text-primary">
+      <rect x="2" y="7" width="16" height="10" rx="2" ry="2" />
+      <path d="M23 11v2" />
+      <path d="M6 11h4" />
+    </svg>
+  ),
+  FileCheck: () => (
+    <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="w-8 h-8 text-primary">
+      <path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z" />
+      <polyline points="14 2 14 8 20 8" />
+      <path d="M9 14l2 2 4-4" />
+    </svg>
+  ),
+};
+
+export default function HomePage() {
+  const features = [
+    {
+      icon: <Icons.Users />,
+      title: "Resource Management",
+      description: "Maintain detailed specialist profiles with skill sets and availability windows.",
+      link: "/dashboard"
+    },
+    {
+      icon: <Icons.Network />,
+      title: "Dependency Mapping",
+      description: "Visualize and enforce execution order using Directed Acyclic Graphs (DAG).",
+      link: "/dashboard"
+    },
+    {
+      icon: <Icons.Scale />,
+      title: "Smart Allocation",
+      description: "Constraint-aware assignment that prevents over-allocation and ensures recovery floors.",
+      link: "/allocate"
+    },
+    {
+      icon: <Icons.Battery />,
+      title: "Sustainability Tracking",
+      description: "Proactive fatigue monitoring and burn rate alerts for sustainable productivity.",
+      link: "/specialist"
+    },
+    {
+      icon: <Icons.FileCheck />,
+      title: "Immutable Auditability",
+      description: "A tamper-evident cryptographic log of every resource decision made.",
+      link: "/dashboard"
+    },
+  ];
+
+  return (
+    <div className="min-h-screen flex flex-col bg-secondary">
+      <Navbar />
+
+      <main className="flex-grow max-w-6xl mx-auto px-6 py-24 w-full">
+        {/* Hero Section - Focused on "Calm Productivity" */}
+        <section className="text-center mb-32 animate-in fade-in slide-in-from-bottom-4 duration-700">
+          <div className="inline-block px-3 py-1 rounded-full bg-primary/10 text-primary text-xs font-medium mb-6">
+            v1.0 Resource Orchestration
+          </div>
+          <h1 className="text-5xl md:text-7xl font-semibold text-slate-900 tracking-tight mb-8 leading-[1.1]">
+            Sustainable <span className="text-primary">Orchestration</span>
+          </h1>
+          <p className="text-lg md:text-xl text-slate-500 max-w-3xl mx-auto mb-12 leading-relaxed">
+            OptiTask balances peak performance with human sustainability.
+            Manage complex dependencies and specialist capacity without the burn-out,
+            grounded in a high-trust, professional environment.
+          </p>
+          <div className="flex justify-center gap-6">
+            <button className="bg-primary text-white px-8 py-4 rounded-interactive font-medium hover:bg-primary-dark transition-all shadow-sm hover:shadow-md">
+              Open Dashboard
+            </button>
+            <button className="bg-white border border-slate-200 text-slate-700 px-8 py-4 rounded-interactive font-medium hover:bg-slate-50 transition-all shadow-sm">
+              View Documentation
+            </button>
+          </div >
+        </section>
+
+        {/* Feature Grid - Spacing increased for breathability */}
+        <section className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-gap animate-in fade-in slide-in-from-bottom-8 duration-1000 delay-200">
+          {features.map((f, i) => (
+            <FeatureCard key={i} {...f} />
+          ))}
+        </section>
+      </main>
+
+      <footer className="py-16 border-t border-slate-200 text-center text-slate-400 text-sm">
+        © 2026 OptiTask Resource Orchestrator. Built for <span className="text-slate-500 italic">Calm Productivity</span>.
+      </footer>
+    </div >
+  );
+}
+\n
+--- FILE: app/specialist/page.tsx ---
+import { Navbar } from '@/components/layout/Navbar';
+import { PageHeader } from '@/components/layout/PageHeader';
+import { SpecialistStats } from '@/components/features/SpecialistStats';
+import { FatigueMonitor } from '@/components/features/FatigueMonitor';
+import { SpecialistHourlyLoad } from '@/components/features/SpecialistHourlyLoad';
+import { Card } from '@/components/ui/Card';
+import { getSpecialistHourlyLoad } from '@/app/actions/capacity';
+import React, { useEffect, useState } from 'react';
+
+export default function SpecialistPage() {
+  // Mock session user
+  const currentUser = { id: 1, role: 'SPECIALIST', name: "Marcus (Senior Dev)" };
+
+  // In a real app, this ID would come from the URL params (e.g., /specialist/[id])
+  const targetSpecialistId = 1;
+
+  const [hourlyLoad, setHourlyLoad] = useState<any[]>([]);
+  const [isForbidden, setIsForbidden] = useState(false);
+  const [fatigueWarning, setFatigueWarning] = useState(false);
+
+  useEffect(() => {
+    // Privacy Wall Check: Only allow if the target ID matches the current user ID
+    if (currentUser.id !== targetSpecialistId) {
+      setIsForbidden(true);
+      return;
+    }
+
+    const loadData = async () => {
+      try {
+        const data = await getSpecialistHourlyLoad(targetSpecialistId);
+        setHourlyLoad(data);
+      } catch (e) {
+        console.error("Failed to load load data", e);
+      }
+    };
+    loadData();
+
+    // Fatigue Monitoring: Check if load > 80% for two consecutive weeks
+    // Mocking historical check for this implementation phase
+    const mockHistoricalLoad = [85, 82]; // Week -1 and Week -2
+    if (mockHistoricalLoad.every(load => load > 80)) {
+      setFatigueWarning(true);
+    }
+  }, [currentUser.id, targetSpecialistId]);
+
+  if (isForbidden) {
+    return (
+      <div className="min-h-screen flex flex-col bg-secondary">
+        <Navbar />
+        <main className="flex-grow flex items-center justify-center px-6">
+          <Card className="p-12 text-center max-w-md border-none shadow-lg bg-white">
+            <div className="text-5xl mb-4">🚫</div>
+            <h1 className="text-2xl font-bold text-slate-900 mb-2">403 Forbidden</h1>
+            <p className="text-slate-500 mb-6">You do not have permission to access this specialist's detailed load view.</p>
+            <a href="/dashboard" className="text-primary font-medium hover:underline">Return to Dashboard</a>
+          </Card>
+        </main>
+      </div>
+    );
+  }
+
+  const data = {
+    name: currentUser.name,
+    load: 85,
+    tasksCount: 4,
+    recoveryWindow: "Friday, 2:00 PM"
+  };
+
+  return (
+    <div className="min-h-screen flex flex-col bg-secondary">
+      <Navbar />
+
+      <main className="flex-grow max-w-4xl mx-auto px-6 py-12 w-full">
+        <PageHeader
+          title={`Welcome back, ${data.name}`}
+          subtitle="Your personal utilization and health monitor."
+        />
+
+        <div className="flex flex-col gap-gap">
+          {fatigueWarning && (
+            <div className="p-4 bg-critical text-white rounded-interactive flex items-center gap-4 animate-bounce shadow-lg">
+              <span className="text-2xl">⚠️</span>
+              <div>
+                <h4 className="font-bold">Fatigue Warning</h4>
+                <p className="text-xs opacity-90">Your burn rate suggests a high probability of fatigue. Please notify your PM to adjust the workload.</p>
+              </div>
+            </div>
+          )}
+          <SpecialistStats
+            specialistName={data.name}
+            load={data.load}
+            tasksCount={data.tasksCount}
+            recoveryWindow={data.recoveryWindow}
+          />
+
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-gap">
+            <div className="md:col-span-2">
+              <FatigueMonitor load={data.load} />
+              <div className="mt-gap">
+                <SpecialistHourlyLoad data={hourlyLoad} />
+              </div>
+            </div>
+            <Card>
+              <h3 className="text-sm font-bold uppercase text-slate-400 mb-3">Quick Actions</h3>
+              <div className="flex flex-col gap-2">
+                <button className="text-left text-sm text-slate-600 hover:text-primary transition-colors">Request Time Off</button>
+                <button className="text-left text-sm text-slate-600 hover:text-primary transition-colors">Report Blockage</button>
+                <button className="text-left text-sm text-slate-600 hover:text-primary transition-colors">Update Availability</button>
+              </div>
+            </Card>
+          </div>
+        </div>
+      </main>
+    </div>
+  );
+}
+\n
+--- FILE: app/specialists/page.tsx ---
+import { Navbar } from '@/components/layout/Navbar';
+import { PageHeader } from '@/components/layout/PageHeader';
+import { SpecialistManagement } from '@/components/features/SpecialistManagement';
+
+export default function SpecialistsPage() {
+  return (
+    <div className="min-h-screen flex flex-col bg-secondary">
+      <Navbar />
+
+      <main className="flex-grow max-w-6xl mx-auto px-6 py-12 w-full">
+        <PageHeader
+          title="Specialist Directory"
+          subtitle="Manage your team's capabilities and sustainable capacity."
+        />
+        <SpecialistManagement />
+      </main>
+    </div>
+  );
+}
+\n
+--- FILE: app/tasks/page.tsx ---
+import { Navbar } from '@/components/layout/Navbar';
+import { PageHeader } from '@/components/layout/PageHeader';
+import { TaskManagement } from '@/components/features/TaskManagement';
+
+export default function TasksPage() {
+  return (
+    <div className="min-h-screen flex flex-col bg-secondary">
+      <Navbar />
+
+      <main className="flex-grow max-w-6xl mx-auto px-6 py-12 w-full">
+        <PageHeader
+          title="Task Directory"
+          subtitle="Define project effort and duration windows."
+        />
+        <TaskManagement />
+      </main>
+    </div>
+  );
+}
+\n
+--- FILE: components/features/AllocationInterface.tsx ---
+'use client';
+
+import React, { useState, useEffect } from 'react';
+import { Card } from '../ui/Card';
+import { Button } from '../ui/Button';
+import { OverrideModal } from './OverrideModal';
+import { getSpecialists, Specialist } from '@/app/actions/specialists';
+import { getTasks, Task } from '@/app/actions/tasks';
+import { validateAllocation, allocateTask, AllocationRequest } from '@/app/actions/engine';
+
+export const AllocationInterface = () => {
+  const [tasks, setTasks] = useState<Task[]>([]);
+  const [specialists, setSpecialists] = useState<Specialist[]>([]);
+  const [selectedTask, setSelectedTask] = useState<string>('');
+  const [selectedSpecialist, setSelectedSpecialist] = useState<string>('');
+  const [validation, setValidation] = useState<{ valid: boolean; error: string; percentage: number } | null>(null);
+  const [isOverrideOpen, setIsOverrideOpen] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
+
+  useEffect(() => {
+    const loadData = async () => {
+      const [t, s] = await Promise.all([getTasks(), getSpecialists()]);
+      setTasks(t);
+      setSpecialists(s.filter(sp => sp.isActive));
+    };
+    loadData();
+  }, []);
+
+  useEffect(() => {
+    const checkCapacity = async () => {
+      if (!selectedSpecialist || !selectedTask) {
+        setValidation(null);
+        return;
+      }
+
+      const task = tasks.find(t => t.id.toString() === selectedTask);
+      const spec = specialists.find(s => s.id.toString() === selectedSpecialist);
+
+      if (!task || !spec) return;
+
+      // Simulate a window (Current Week) for the sake of the demo
+      const today = new Date().toISOString().split('T')[0];
+      const nextWeek = new Date();
+      nextWeek.setDate(nextWeek.getDate() + 7);
+      const end = nextWeek.toISOString().split('T')[0];
+
+      const result = await validateAllocation({
+        specialistId: spec.id,
+        taskId: task.id,
+        hours: task.duration,
+        windowStart: today,
+        windowEnd: end,
+      });
+      setValidation(result);
+    };
+    checkCapacity();
+  }, [selectedTask, selectedSpecialist, tasks, specialists]);
+
+  const handleSave = async (overrideData?: { priority: string; rationale: string }) => {
+    setIsSaving(true);
+    try {
+      const task = tasks.find(t => t.id.toString() === selectedTask);
+      const spec = specialists.find(s => s.id.toString() === selectedSpecialist);
+      if (!task || !spec) throw new Error("Invalid selection");
+
+      const today = new Date().toISOString().split('T')[0];
+      const nextWeek = new Date();
+      nextWeek.setDate(nextWeek.getDate() + 7);
+      const end = nextWeek.toISOString().split('T')[0];
+
+      await allocateTask({
+        specialistId: spec.id,
+        taskId: task.id,
+        hours: task.duration,
+        windowStart: today,
+        windowEnd: end,
+      }, overrideData);
+
+      setSelectedTask('');
+      setSelectedSpecialist('');
+      setValidation(null);
+      setIsOverrideOpen(false);
+      alert("Allocation saved successfully.");
+    } catch (err: any) {
+      alert(err.message);
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  return (
+    <>
+      <Card className="max-w-2xl mx-auto border-none shadow-md bg-white">
+        <div className="flex flex-col gap-10 p-6">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
+            <div className="flex flex-col gap-3">
+              <label className="text-xs font-bold uppercase tracking-widest text-slate-400">Task Selection</label>
+              <select
+                className="p-3 border border-slate-200 rounded-interactive bg-slate-50 text-slate-900 focus:ring-2 focus:ring-primary outline-none transition-all cursor-pointer"
+                value={selectedTask}
+                onChange={(e) => setSelectedTask(e.target.value)}
+              >
+                <option value="">Select a task...</option>
+                {tasks.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
+              </select>
+            </div>
+            <div className="flex flex-col gap-3">
+              <label className="text-xs font-bold uppercase tracking-widest text-slate-400">Specialist Selection</label>
+              <select
+                className="p-3 border border-slate-200 rounded-interactive bg-slate-50 text-slate-900 focus:ring-2 focus:ring-primary outline-none transition-all cursor-pointer"
+                value={selectedSpecialist}
+                onChange={(e) => setSelectedSpecialist(e.target.value)}
+              >
+                <option value="">Select a specialist...</option>
+                {specialists.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+              </select>
+            </div>
+          </div>
+
+          <div className={`p-5 rounded-interactive border transition-all duration-500 ${
+            !selectedSpecialist ? 'bg-slate-50 border-slate-200 text-slate-400' :
+            validation?.valid === false ? 'bg-critical/10 border-critical text-critical-dark shadow-sm' :
+            validation?.valid === true ? 'bg-success/10 border-success text-success-dark shadow-sm' :
+            'bg-slate-50 border-slate-200 text-slate-400'
+          }`}>
+            <div className="flex items-center gap-3">
+              <div className={`w-2 h-2 rounded-full ${
+                !selectedSpecialist ? 'bg-slate-300' :
+                validation?.valid === false ? 'bg-critical animate-pulse' :
+                validation?.valid === true ? 'bg-success' : 'bg-slate-300'
+              }`} />
+              <div className="text-sm font-medium leading-relaxed">
+                {!selectedSpecialist ? (
+                  "Please select a specialist to validate capacity constraints."
+                ) : validation?.valid === false ? (
+                  validation.error
+                ) : (
+                  `Sustainable Allocation: Current load is ${validation?.percentage.toFixed(1)}%.`
+                )}
+              </div>
+            </div>
+          </div>
+
+          <div className="flex justify-end gap-4 pt-4 border-t border-slate-100">
+            <Button
+              variant="ghost"
+              disabled={!selectedSpecialist || validation?.valid === true}
+              onClick={() => setIsOverrideOpen(true)}
+              className="text-slate-500 hover:text-primary"
+            >
+              Request Override
+            </Button>
+            <Button
+              disabled={!selectedTask || !selectedSpecialist || (validation && !validation.valid)}
+              onClick={() => handleSave()}
+              className="px-6 shadow-sm"
+            >
+              {isSaving ? 'Saving...' : 'Save Allocation'}
+            </Button>
+          </div>
+        </div>
+      </Card>
+
+      <OverrideModal
+        isOpen={isOverrideOpen}
+        onClose={() => setIsOverrideOpen(false)}
+        specialistName={specialists.find(s => s.id.toString() === selectedSpecialist)?.name || 'Unknown'}
+        onConfirm={(data) => handleSave(data)}
+      />
+    </>
+  );
+};
+\n
+--- FILE: components/features/FatigueMonitor.tsx ---
+'use client';
+
+import React from 'react';
+import { Card } from '../ui/Card';
+
+type FatigueMonitorProps = {
+  load: number;
+};
+
+export const FatigueMonitor = ({ load }: FatigueMonitorProps) => {
+  const isCritical = load > 90;
+  const isWarning = load > 75;
+
+  return (
+    <Card className="overflow-hidden border-none shadow-sm bg-white/50 backdrop-blur-sm">
+      <div className="flex flex-col gap-6">
+        <div className="flex items-center justify-between">
+          <div className="flex flex-col">
+            <h3 className="text-lg font-semibold text-slate-900">Fatigue Monitor</h3>
+            <span className="text-xs text-slate-400">Human sustainability index</span>
+          </div>
+          <span className={`text-[10px] font-bold uppercase tracking-widest px-2 py-1 rounded-full transition-colors duration-500 ${
+            isCritical ? 'bg-critical text-white' :
+            isWarning ? 'bg-warning text-slate-900' :
+            'bg-success text-slate-900'
+          }`}>
+            {isCritical ? 'High Risk' : isWarning ? 'Elevated Risk' : 'Stable'}
+          </span>
+        </div>
+
+        <div className="flex flex-col gap-4">
+          <div className="relative h-6 bg-slate-100 rounded-full overflow-hidden border border-slate-200 shadow-inner">
+            <div
+              className={`absolute top-0 left-0 h-full transition-all duration-1000 ease-out ${
+                isCritical ? 'bg-critical' :
+                isWarning ? 'bg-warning' :
+                'bg-success'
+              }`}
+              style={{ width: `${Math.min(load, 100)}%` }}
+            />
+            {/* Threshold Markers */}
+            <div className="absolute top-0 bottom-0 left-[75%] w-0.5 bg-slate-300/50" />
+            <div className="absolute top-0 bottom-0 left-[90%] w-0.5 bg-slate-400/50" />
+          </div>
+
+          <div className="flex justify-between text-[10px] font-bold uppercase tracking-tighter text-slate-400">
+            <span>Sustainable (0-75%)</span>
+            <span>At Risk (75-90%)</span>
+            <span>Critical (90%+)</span>
+          </div>
+        </div>
+
+        <div className="p-4 rounded-interactive bg-slate-50 border border-slate-100">
+          <p className="text-sm text-slate-600 italic leading-relaxed">
+            {isCritical
+              ? "Critical: Burn rate suggests high probability of fatigue. Immediate recovery floor enforcement recommended."
+              : isWarning
+              ? "Warning: Load is approaching critical threshold. Consider redistributing upcoming tasks to maintain sustainability."
+              : "Optimal: Current allocation is within sustainable parameters."}
+          </p>
+        </div>
+      </div>
+    </Card>
+  );
+};
+\n
+--- FILE: components/features/FeatureCard.tsx ---
+import React from 'react';
+import { Card } from '../ui/Card';
+import { Button } from '../ui/Button';
+
+type FeatureCardProps = {
+  icon: React.ReactNode;
+  title: string;
+  description: string;
+};
+
+export const FeatureCard = ({ icon, title, description }: FeatureCardProps) => {
+  return (
+    <Card className="flex flex-col h-full group hover:border-primary transition-colors">
+      <div className="text-3xl mb-4 group-hover:scale-110 transition-transform duration-200">
+        {icon}
+      </div>
+      <h3 className="text-lg font-semibold text-slate-900 mb-2">{title}</h3>
+      <p className="text-slate-500 text-sm mb-6 flex-grow">{description}</p>
+      <Button variant="outline" className="w-fit">
+        Explore
+      </Button>
+    </Card>
+  );
+};
+\n
+--- FILE: components/features/HeatmapCell.tsx ---
+'use client';
+
+import React from 'react';
+
+type HeatmapCellProps = {
+  specialist: string;
+  load: number;
+  hours: number;
+  capacity: number;
+};
+
+export const HeatmapCell = ({ specialist, load, hours, capacity }: HeatmapCellProps) => {
+  const getColor = () => {
+    if (load <= 80) return 'bg-success text-success-dark';
+    if (load <= 100) return 'bg-warning text-warning-dark';
+    return 'bg-critical text-critical-dark';
+  };
+
+  return (
+    <div
+      className={`p-4 rounded-interactive transition-all duration-300 cursor-help group relative
+      ${getColor()} hover:brightness-95 hover:shadow-sm active:scale-95`}
+      aria-label={`Specialist ${specialist}, load ${load}%`}
+    >
+      <div className="text-slate-900 font-medium text-xs truncate opacity-80">{specialist}</div>
+      <div className="text-slate-900 font-bold text-2xl">{load}%</div>
+
+      {/* Refined Tooltip */}
+      <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-3 hidden group-hover:block
+        w-48 p-3 bg-slate-900 text-white text-xs rounded-lg shadow-xl z-20 animate-in fade-in zoom-in-95 duration-200">
+        <div className="flex flex-col gap-1">
+          <span className="font-bold text-slate-300">{specialist}</span>
+          <div className="flex justify-between items-center gap-4">
+            <span className="text-slate-400">Allocated Hours:</span>
+            <span className="font-mono font-bold">{hours.toFixed(1)}h / {capacity}h</span>
+          </div>
+          <div className="mt-1 pt-1 border-t border-slate-700 text-[10px] text-slate-400 italic">
+            {load > 100 ? '⚠️ Capacity Debt' : '✅ Sustainable'}
+          </div>
+        </div>
+        {/* Tooltip Arrow */}
+        <div className="absolute bottom-0 left-1/2 -translate-x-1/2 w-2 h-2 bg-slate-900 rotate-45 -mb-1"></div>
+      </div>
+    </div>
+  );
+};
+\n
+--- FILE: components/features/OverrideModal.tsx ---
+'use client';
+
+import React, { useState } from 'react';
+import { Modal } from '../ui/Modal';
+import { Button } from '../ui/Button';
+
+type OverrideModalProps = {
+  isOpen: boolean;
+  onClose: () => void;
+  specialistName: string;
+  onConfirm: (data: { priority: string; rationale: string }) => void;
+};
+
+export const OverrideModal = ({ isOpen, onClose, specialistName, onConfirm }: OverrideModalProps) => {
+  const [priority, setPriority] = useState('Medium');
+  const [rationale, setRationale] = useState('');
+
+  const handleSubmit = () => {
+    onConfirm({ priority, rationale });
+    setRationale('');
+    setPriority('Medium');
+  };
+
+  return (
+    <Modal
+      isOpen={isOpen}
+      onClose={onClose}
+      title={`Capacity Override: ${specialistName}`}
+      footer={
+        <div className="flex justify-end gap-3">
+          <Button variant="ghost" onClick={onClose} className="text-slate-500">Cancel</Button>
+          <Button
+            disabled={!rationale}
+            onClick={handleSubmit}
+            className="px-6"
+          >
+            Confirm Override
+          </Button>
+        </div>
+      }
+    >
+      <div className="flex flex-col gap-6">
+        <div className="p-4 rounded-interactive bg-critical/10 border border-critical/20 text-critical-dark text-sm leading-relaxed">
+          <p className="font-semibold mb-1">Warning: Capacity Debt</p>
+          You are assigning a task to a specialist who is already at or over 100% capacity.
+          This bypasses sustainable floors and increases the risk of fatigue-induced errors.
+        </p>
+        <div className="flex flex-col gap-4">
+          <div className="flex flex-col gap-2">
+            <label className="text-xs font-bold uppercase tracking-widest text-slate-400">Priority Level</label>
+            <select
+              value={priority}
+              onChange={(e) => setPriority(e.target.value)}
+              className="p-3 border border-slate-200 rounded-interactive bg-white text-slate-900 outline-none focus:ring-2 focus:ring-primary"
+            >
+              <option value="Low">Low</option>
+              <option value="Medium">Medium</option>
+              <option value="High">High</option>
+              <option value="Critical">Critical</option>
+            </select>
+          </div>
+          <div className="flex flex-col gap-2">
+            <label className="text-xs font-bold uppercase tracking-widest text-slate-400">Justification Required</label>
+            <textarea
+              className="p-4 border border-slate-200 rounded-interactive bg-white text-slate-900 h-32 resize-none focus:ring-2 focus:ring-primary outline-none transition-all placeholder:text-slate-300"
+              placeholder="Describe the critical business need that justifies this over-allocation..."
+              value={rationale}
+              onChange={(e) => setRationale(e.target.value)}
+            />
+          </div>
+        </div>
+      </div>
+    </Modal>
+  );
+};
+\n
+--- FILE: components/features/ResourceHeatmap.tsx ---
+'use client';
+
+import { useState, useEffect } from 'react';
+import { Card } from '../ui/Card';
+import { HeatmapCell } from './HeatmapCell';
+import { getHeatmapData } from '@/app/actions/heatmap';
+
+type HeatmapData = {
+  specialist: string;
+  load: number;
+  hours: number;
+  capacity: number;
+};
+
+export const ResourceHeatmap = () => {
+  const [data, setData] = useState<HeatmapData[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  const loadData = async () => {
+    setLoading(true);
+    try {
+      const res = await getHeatmapData();
+      setData(res);
+    } catch (e) {
+      console.error("Failed to load heatmap data", e);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    loadData();
+  }, []);
+
+  if (loading) {
+    return (
+      <Card className="w-full h-48 flex items-center justify-center text-slate-400 italic">
+        Loading capacity data...
+      </Card>
+    );
+  }
+
+  return (
+    <Card className="w-full border-none shadow-sm bg-white/50 backdrop-blur-sm">
+      <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-gap">
+        {data.map((item, i) => (
+          <HeatmapCell key={i} {...item} />
+        ))}
+      </div >
+    </Card>
+  );
+};
+\n
+--- FILE: components/features/RiskItem.tsx ---
+'use client';
+
+import React from 'react';
+
+type RiskItemProps = {
+  title: string;
+  severity: 'success' | 'warning' | 'critical';
+  type: string;
+  desc: string;
+};
+
+const SeverityIcons = {
+  success: () => <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" className="text-success"><polyline points="20 6 9 17 4 12"/></svg>,
+  warning: () => <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" className="text-warning"><path d="M12 9v4m0 4h.01m-6.938 4h13.88a2 2 0 0 0 1.998-1.88l-3.5-5.64a2 2 0 0 0-1.998-1.88H8.348a2 2 0 0 0-1.998 1.88l-3.5 5.64A2 2 0 0 0 4.348 23z"/></svg>,
+  critical: () => <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" className="text-critical"><circle cx="12" cy="12" r="10"/><path d="M12 8v8M8 12h8"/></svg>,
+};
+
+export const RiskItem = ({ title, severity, type, desc }: RiskItemProps) => {
+  return (
+    <div className="p-4 rounded-interactive border border-slate-200 bg-white flex gap-4 items-start group hover:border-primary/50 transition-all cursor-default shadow-sm">
+      <div className="mt-1">
+        {SeverityIcons[severity]()}
+      </div>
+      <div className="flex-grow">
+        <div className="flex items-center gap-2 mb-1">
+          <span className="text-[10px] font-bold uppercase tracking-widest text-slate-400">{type}</span>
+          <span className="text-sm font-semibold text-slate-900">{title}</span>
+        </div>
+        <p className="text-xs text-slate-500 leading-relaxed">{desc}</p>
+      </div>
+    </div>
+  );
+};
+\n
+--- FILE: components/features/RiskPanel.tsx ---
+'use client';
+
+import React, { useState, useEffect } from 'react';
+import { Card } from '../ui/Card';
+import { RiskItem } from './RiskItem';
+import { getScheduleRisks, Risk } from '@/app/actions/risks';
+
+export const RiskPanel = () => {
+  const [risks, setRisks] = useState<Risk[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  const loadRisks = async () => {
+    setLoading(true);
+    try {
+      const data = await getScheduleRisks();
+      setRisks(data);
+    } catch (e) {
+      console.error("Failed to load risks", e);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    loadRisks();
+  }, []);
+
+  if (loading) {
+    return (
+      <Card className="w-full h-full flex items-center justify-center text-slate-400 italic">
+        Scanning for risks...
+      </Card>
+    );
+  }
+
+  return (
+    <Card className="w-full h-full border-none shadow-sm bg-white/50 backdrop-blur-sm">
+      <div className="flex flex-col h-full">
+        <div className="flex items-center justify-between mb-6">
+          <h3 className="text-lg font-semibold text-slate-900">Active Risks</h3>
+          <span className="px-2 py-1 rounded-full bg-critical/10 text-critical text-[10px] font-bold uppercase tracking-wider">
+            {risks.filter(r => r.severity === 'critical').length} Critical
+          </span>
+        </div>
+        <div className="flex flex-col gap-3">
+          {risks.length === 0 ? (
+            <div className="py-10 text-center text-slate-400 text-sm italic">
+              No risks detected. Schedule is sustainable.
+            </div>
+          ) : (
+            risks.map(risk => (
+              <RiskItem key={risk.id} {...risk} />
+            ))
+          )}
+        </div>
+      </div>
+    </Card>
+  );
+};
+\n
+--- FILE: components/features/SpecialistHourlyLoad.tsx ---
+'use client';
+
+import React from 'react';
+import { Card } from '../ui/Card';
+
+type HourlyLoadItem = {
+  windowStart: string;
+  hours: number;
+  taskName: string;
+};
+
+export const SpecialistHourlyLoad = ({ data }: { data: HourlyLoadItem[] }) => {
+  return (
+    <Card className="w-full border-none shadow-sm bg-white/50 backdrop-blur-sm">
+      <h3 className="text-sm font-bold uppercase tracking-widest text-slate-400 mb-4">Detailed Hourly Load</h3>
+      <div className="flex flex-col gap-3">
+        {data.length === 0 ? (
+          <p className="text-sm text-slate-500 italic">No allocations found for the current period.</p>
+        ) : (
+          data.map((item, i) => (
+            <div key={i} className="flex items-center justify-between p-3 rounded-interactive bg-white border border-slate-100 hover:border-primary/30 transition-all">
+              <div className="flex flex-col gap-1">
+                <span className="text-xs font-medium text-slate-900">{item.taskName}</span>
+                <span className="text-[10px] text-slate-400">{item.windowStart}</span>
+              </div>
+              <div className="flex items-center gap-2">
+                <span className="text-xs font-bold text-primary">{item.hours}h</span>
+                <div className="w-20 h-1.5 bg-slate-100 rounded-full overflow-hidden">
+                  <div
+                    className="h-full bg-primary transition-all"
+                    style={{ width: `${Math.min((item.hours / 8) * 100, 100)}%` }}
+                  />
+                </div>
+              </div>
+            </div>
+          ))
+        )}
+      </div>
+    </Card>
+  );
+};
+\n
+--- FILE: components/features/SpecialistManagement.tsx ---
+'use client';
+
+import React, { useState, useEffect } from 'react';
+import { Card } from '../ui/Card';
+import { Button } from '../ui/Button';
+import { Modal } from '../ui/Modal';
+import { getSpecialists, createSpecialist, updateSpecialist, deactivateSpecialist, getFilteredSpecialists, Specialist } from '@/app/actions/specialists';
+
+export const SpecialistManagement = () => {
+  const [specialists, setSpecialists] = useState<Specialist[]>([]);
+  const [isCreateOpen, setIsCreateOpen] = useState(false);
+  const [editingSpecialist, setEditingSpecialist] = useState<Specialist | null>(null);
+
+  const [filters, setFilters] = useState({
+    seniority: '',
+    skills: '',
+    availableOnly: false,
+    windowStart: new Date().toISOString().split('T')[0],
+    windowEnd: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0]
+  });
+
+  const loadSpecialists = async () => {
+    let data;
+    if (filters.seniority || filters.skills || filters.availableOnly) {
+      data = await getFilteredSpecialists({
+        skills: filters.skills ? filters.skills.split(',').map(s => s.trim()) : [],
+        seniority: filters.seniority || null,
+        availableOnly: filters.availableOnly,
+        windowStart: filters.windowStart,
+        windowEnd: filters.windowEnd
+      });
+    } else {
+      data = await getSpecialists();
+    }
+    setSpecialists(data);
+  };
+
+  useEffect(() => {
+    loadSpecialists();
+  }, [filters]);
+
+  const handleCreate = async (e: React.FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    const formData = new FormData(e.currentTarget);
+    const data = {
+      name: formData.get('name') as string,
+      skillTags: (formData.get('skills') as string).split(',').map(s => s.trim()).filter(Boolean),
+      seniority: formData.get('seniority') as any,
+      availabilityHoursPerWeek: parseFloat(formData.get('hours') as string),
+      isActive: true
+    };
+    await createSpecialist(data);
+    setIsCreateOpen(false);
+    loadSpecialists();
+  };
+
+  const handleUpdate = async (e: React.FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    if (!editingSpecialist) return;
+    const formData = new FormData(e.currentTarget);
+    const data = {
+      name: formData.get('name') as string,
+      skillTags: (formData.get('skills') as string).split(',').map(s => s.trim()).filter(Boolean),
+      seniority: formData.get('seniority') as any,
+      availabilityHoursPerWeek: parseFloat(formData.get('hours') as string),
+    };
+    await updateSpecialist(editingSpecialist.id, data);
+    setEditingSpecialist(null);
+    loadSpecialists();
+  };
+
+  const handleDeactivate = async (id: number) => {
+    await deactivateSpecialist(id);
+    loadSpecialists();
+  };
+
+  return (
+    <div className="flex flex-col gap-8">
+      <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
+        <div>
+          <h2 className="text-2xl font-semibold text-slate-900">Specialist Inventory</h2>
+          <p className="text-sm text-slate-500">Manage your team's capabilities and availability.</p>
+        </div>
+        <Button onClick={() => setIsCreateOpen(true)}>Add Specialist</Button>
+      </div>
+
+      {/* Filter Bar - Calm Productivity style */}
+      <Card className="p-4 border-none shadow-sm bg-white/50 backdrop-blur-sm">
+        <div className="flex flex-col md:flex-row gap-4 items-center">
+          <div className="flex flex-col gap-1 w-full md:w-auto">
+            <label className="text-[10px] font-bold uppercase tracking-widest text-slate-400">Skill Search</label>
+            <input
+              value={filters.skills}
+              onChange={(e) => setFilters(f => ({ ...f, skills: e.target.value }))}
+              placeholder="e.g. TypeScript, React..."
+              className="p-2 text-sm border border-slate-200 rounded-interactive bg-white focus:ring-2 focus:ring-primary outline-none transition-all"
+            />
+          </div>
+          <div className="flex flex-col gap-1 w-full md:w-auto">
+            <label className="text-[10px] font-bold uppercase tracking-widest text-slate-400">Seniority</label>
+            <select
+              value={filters.seniority}
+              onChange={(e) => setFilters(f => ({ ...f, seniority: e.target.value }))}
+              className="p-2 text-sm border border-slate-200 rounded-interactive bg-white focus:ring-2 focus:ring-primary outline-none transition-all"
+            >
+              <option value="">All Levels</option>
+              <option value="Junior">Junior</option>
+              <option value="Mid">Mid</option>
+              <option value="Senior">Senior</option>
+              <option value="Staff">Staff</option>
+            </select>
+          </div>
+          <div className="flex items-center gap-3 pt-4">
+            <input
+              type="checkbox"
+              id="avail-filter"
+              checked={filters.availableOnly}
+              onChange={(e) => setFilters(f => ({ ...f, availableOnly: e.target.checked }))}
+              className="w-4 h-4 rounded border-slate-300 text-primary focus:ring-primary"
+            />
+            <label htmlFor="avail-filter" className="text-sm font-medium text-slate-600 cursor-pointer">
+              Show Available Only
+            </label>
+          </div>
+          <Button variant="ghost" className="text-xs h-10" onClick={() => setFilters({
+            seniority: '',
+            skills: '',
+            availableOnly: false,
+            windowStart: new Date().toISOString().split('T')[0],
+            windowEnd: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0]
+          })}>Reset</Button>
+        </div>
+      </Card>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-gap">
+        {specialists.length === 0 ? (
+          <div className="col-span-full py-20 text-center text-slate-400 italic border-2 border-dashed border-slate-200 rounded-interactive">
+            No specialists found matching the current filters.
+          </div>
+        ) : (
+          specialists.map(s => (
+            <Card key={s.id} className="flex flex-col justify-between group hover:border-primary transition-all duration-300">
+              <div className="flex flex-col gap-4">
+                <div className="flex justify-between items-start">
+                  <div className="w-10 h-10 rounded-full bg-slate-100 flex items-center justify-center text-xl group-hover:bg-primary/10 transition-colors">
+                    👤
+                  </div>
+                  <span className={`text-[10px] font-bold px-2 py-1 rounded-full ${s.isActive ? 'bg-success/20 text-success-dark' : 'bg-slate-200 text-slate-500'}`}>
+                    {s.isActive ? 'Active' : 'Inactive'}
+                  </span>
+                </div>
+                <div>
+                  <h3 className="font-semibold text-slate-900 text-lg">{s.name}</h3>
+                  <p className="text-xs text-slate-500 mb-3">{s.seniority}</p>
+                  <div className="flex flex-wrap gap-1.5 mb-4">
+                    {s.skillTags.map(tag => (
+                      <span key={tag} className="text-[10px] bg-white text-slate-600 px-2 py-0.5 rounded border border-slate-200 shadow-sm">
+                        {tag}
+                      </span>
+                    ))}
+                  </div>
+                  <div className="text-sm text-slate-600 flex items-center gap-2">
+                    <span className="text-slate-400">Availability:</span>
+                    <span className="font-medium text-slate-900">{s.availabilityHoursPerWeek}h/week</span>
+                  </div>
+                </div>
+              </div>
+              <div className="flex gap-3 mt-6 pt-4 border-t border-slate-100">
+                <Button variant="ghost" className="text-xs flex-grow" onClick={() => setEditingSpecialist(s)}>Edit</Button>
+                {s.isActive && (
+                  <Button variant="outline" className="text-xs text-critical flex-grow" onClick={() => handleDeactivate(s.id)}>Deactivate</Button>
+                )}
+              </div>
+            </Card>
+          ))
+        )}
+      </div>
+
+      <Modal
+        isOpen={isCreateOpen}
+        onClose={() => setIsCreateOpen(false)}
+        title="Create New Specialist"
+      >
+        <form onSubmit={handleCreate} className="flex flex-col gap-5">
+          <div className="flex flex-col gap-2">
+            <label className="text-xs font-bold uppercase tracking-widest text-slate-400">Full Name</label>
+            <input name="name" required className="p-3 border border-slate-200 rounded-interactive bg-slate-50 focus:ring-2 focus:ring-primary outline-none transition-all" />
+          </div>
+          <div className="flex flex-col gap-2">
+            <label className="text-xs font-bold uppercase tracking-widest text-slate-400">Skills (comma separated)</label>
+            <input name="skills" placeholder="e.g. TypeScript, Architecture, AWS" required className="p-3 border border-slate-200 rounded-interactive bg-slate-50 focus:ring-2 focus:ring-primary outline-none transition-all" />
+          </div>
+          <div className="grid grid-cols-2 gap-6">
+            <div className="flex flex-col gap-2">
+              <label className="text-xs font-bold uppercase tracking-widest text-slate-400">Seniority</label>
+              <select name="seniority" className="p-3 border border-slate-200 rounded-interactive bg-slate-50 focus:ring-2 focus:ring-primary outline-none transition-all">
+                <option value="Junior">Junior</option>
+                <option value="Mid">Mid</option>
+                <option value="Senior">Senior</option>
+                <option value="Staff">Staff</option>
+              </select>
+            </div>
+            <div className="flex flex-col gap-2">
+              <label className="text-xs font-bold uppercase tracking-widest text-slate-400">Weekly Hours</label>
+              <input name="hours" type="number" required className="p-3 border border-slate-200 rounded-interactive bg-slate-50 focus:ring-2 focus:ring-primary outline-none transition-all" />
+            </div>
+          </div>
+          <Button type="submit" className="mt-4 w-full py-3">Create Specialist</Button>
+        </form>
+      </Modal>
+
+      <Modal
+        isOpen={!!editingSpecialist}
+        onClose={() => setEditingSpecialist(null)}
+        title="Edit Specialist"
+      >
+        {editingSpecialist && (
+          <form onSubmit={handleUpdate} className="flex flex-col gap-5">
+            <div className="flex flex-col gap-2">
+              <label className="text-xs font-bold uppercase tracking-widest text-slate-400">Full Name</label>
+              <input name="name" defaultValue={editingSpecialist.name} required className="p-3 border border-slate-200 rounded-interactive bg-slate-50 focus:ring-2 focus:ring-primary outline-none transition-all" />
+            </div>
+            <div className="flex flex-col gap-2">
+              <label className="text-xs font-bold uppercase tracking-widest text-slate-400">Skills (comma separated)</label>
+              <input name="skills" defaultValue={editingSpecialist.skillTags.join(', ')} required className="p-3 border border-slate-200 rounded-interactive bg-slate-50 focus:ring-2 focus:ring-primary outline-none transition-all" />
+            </div>
+            <div className="grid grid-cols-2 gap-6">
+              <div className="flex flex-col gap-2">
+                <label className="text-xs font-bold uppercase tracking-widest text-slate-400">Seniority</label>
+                <select name="seniority" defaultValue={editingSpecialist.seniority} className="p-3 border border-slate-200 rounded-interactive bg-slate-50 focus:ring-2 focus:ring-primary outline-none transition-all">
+                  <option value="Junior">Junior</option>
+                  <option value="Mid">Mid</option>
+                  <option value="Senior">Senior</option>
+                  <option value="Staff">Staff</option>
+                </select>
+              </div>
+              <div className="flex flex-col gap-2">
+                <label className="text-xs font-bold uppercase tracking-widest text-slate-400">Weekly Hours</label>
+                <input name="hours" type="number" defaultValue={editingSpecialist.availabilityHoursPerWeek} required className="p-3 border border-slate-200 rounded-interactive bg-slate-50 focus:ring-2 focus:ring-primary outline-none transition-all" />
+              </div>
+            </div>
+            <Button type="submit" className="mt-4 w-full py-3">Update Specialist</Button>
+          </form>
+        )}
+      </Modal>
+    </div>
+  );
+};
+\n
+--- FILE: components/features/SpecialistStats.tsx ---
+'use client';
+
+import React from 'react';
+import { Card } from '../ui/Card';
+
+type StatsProps = {
+  specialistName: string;
+  load: number;
+  tasksCount: number;
+  recoveryWindow: string;
+};
+
+export const SpecialistStats = ({ specialistName, load, tasksCount, recoveryWindow }: StatsProps) => {
+  return (
+    <div className="grid grid-cols-1 md:grid-cols-3 gap-gap">
+      <Card className="border-none shadow-sm bg-white/50 backdrop-blur-sm hover:bg-white transition-colors group">
+        <span className="text-xs font-bold uppercase tracking-widest text-slate-400 group-hover:text-primary transition-colors">Current Load</span>
+        <div className="text-4xl font-semibold text-slate-900 mt-2 flex items-baseline gap-2">
+          {load}<span className="text-lg text-slate-400">%</span>
+        </div>
+      </Card>
+      <Card className="border-none shadow-sm bg-white/50 backdrop-blur-sm hover:bg-white transition-colors group">
+        <span className="text-xs font-bold uppercase tracking-widest text-slate-400 group-hover:text-primary transition-colors">Active Tasks</span>
+        <div className="text-4xl font-semibold text-slate-900 mt-2">
+          {tasksCount}
+        </div>
+      </Card>
+      <Card className="border-none shadow-sm bg-white/50 backdrop-blur-sm hover:bg-white transition-colors group">
+        <span className="text-xs font-bold uppercase tracking-widest text-slate-400 group-hover:text-primary transition-colors">Next Recovery</span>
+        <div className="text-xl font-semibold text-slate-900 mt-2 leading-tight">
+          {recoveryWindow}
+        </div>
+      </Card>
+    </div>
+  );
+};
+\n
+--- FILE: components/features/TaskManagement.tsx ---
+'use client';
+
+import React, { useState, useEffect } from 'react';
+import { Card } from '../ui/Card';
+import { Button } from '../ui/Button';
+import { Modal } from '../ui/Modal';
+import { getTasks, createTask, updateTask, addDependency, Task } from '@/app/actions/tasks';
+
+export const TaskManagement = () => {
+  const [tasks, setTasks] = useState<Task[]>([]);
+  const [isCreateOpen, setIsCreateOpen] = useState(false);
+  const [editingTask, setEditingTask] = useState<Task | null>(null);
+  const [isDepOpen, setIsDepOpen] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const loadTasks = async () => {
+    const data = await getTasks();
+    setTasks(data);
+  };
+
+  useEffect(() => {
+    loadTasks();
+  }, []);
+
+  const handleCreate = async (e: React.FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    setError(null);
+    const formData = new FormData(e.currentTarget);
+    const data = {
+      name: formData.get('name') as string,
+      duration: parseFloat(formData.get('duration') as string),
+      startDate: formData.get('startDate') as string,
+      endDate: formData.get('endDate') as string,
+    };
+
+    try {
+      await createTask(data);
+      setIsCreateOpen(false);
+      loadTasks();
+    } catch (err: any) {
+      setError(err.message);
+    }
+  };
+
+  const handleUpdate = async (e: React.FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    setError(null);
+    if (!editingTask) return;
+    const formData = new FormData(e.currentTarget);
+    const data = {
+      name: formData.get('name') as string,
+      duration: parseFloat(formData.get('duration') as string),
+      startDate: formData.get('startDate') as string,
+      endDate: formData.get('endDate') as string,
+    };
+
+    try {
+      await updateTask(editingTask.id, data);
+      setEditingTask(null);
+      loadTasks();
+    } catch (err: any) {
+      setError(err.message);
+    }
+  };
+
+  const handleAddDependency = async (e: React.FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    setError(null);
+    const formData = new FormData(e.currentTarget);
+    const parentId = parseInt(formData.get('parent') as string);
+    const childId = parseInt(formData.get('child') as string);
+
+    try {
+      await addDependency(parentId, childId);
+      setIsDepOpen(false);
+      loadTasks();
+    } catch (err: any) {
+      setError(err.message);
+    }
+  };
+
+  return (
+    <div className="flex flex-col gap-8">
+      <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
+        <div>
+          <h2 className="text-2xl font-semibold text-slate-900">Task Inventory</h2>
+          <p className="text-sm text-slate-500">Define project effort and duration windows.</p>
+        </div>
+        <div className="flex gap-3">
+          <Button variant="outline" onClick={() => setIsDepOpen(true)}>Link Dependency</Button>
+          <Button onClick={() => setIsCreateOpen(true)}>Add Task</Button>
+        </div>
+      </div>
+
+      {error && (
+        <div className="p-4 bg-critical/10 border border-critical/20 text-critical-dark text-sm rounded-interactive animate-in fade-in slide-in-from-top-2 duration-300">
+          <div className="flex items-center gap-2">
+            <span className="font-bold">⚠️ Validation Error:</span>
+            {error}
+          </div>
+        </div>
+      )}
+
+      <div className="grid grid-cols-1 gap-gap">
+        {tasks.length === 0 ? (
+          <div className="py-20 text-center text-slate-400 italic border-2 border-dashed border-slate-200 rounded-interactive">
+            No tasks defined yet. Start by adding your first task.
+          </div>
+        ) : (
+          tasks.map(t => (
+            <Card key={t.id} className="flex items-center justify-between group hover:border-primary transition-all duration-300 border-none shadow-sm bg-white/50 backdrop-blur-sm">
+              <div className="flex items-center gap-4">
+                <div className="w-10 h-10 rounded-full bg-slate-100 flex items-center justify-center text-xl group-hover:bg-primary/10 transition-colors">
+                  📝
+                </div>
+                <div>
+                  <h3 className="font-semibold text-slate-900">{t.name} {t.isBlocked && <span className="ml-2 text-[10px] bg-critical/20 text-critical-dark px-2 py-0.5 rounded-full font-bold uppercase">Blocked</span>}</h3>
+                  <div className="flex items-center gap-3 text-xs text-slate-500">
+                    <span>Duration: <span className="font-medium text-slate-700">{t.duration}h</span></span>
+                    <span className="text-slate-300">|</span>
+                    <span>Status: <span className={`font-medium ${t.isBlocked ? 'text-critical' : 'text-slate-700'}`}>{t.isBlocked ? 'Blocked' : t.status}</span></span>
+                    {t.startDate && (
+                      <>
+                        <span className="text-slate-300">|</span>
+                        <span>Starts: {t.startDate}</span>
+                      </>
+                    )}
+                  </div>
+                </div>
+              </div>
+              <div className="flex gap-2">
+                <Button variant="ghost" className="text-xs" onClick={() => setEditingTask(t)}>Edit</Button>
+              </div>
+            </Card>
+          ))
+        )}
+      </div>
+
+      <Modal
+        isOpen={isCreateOpen}
+        onClose={() => setIsCreateOpen(false)}
+        title="Create New Task"
+      >
+        <form onSubmit={handleCreate} className="flex flex-col gap-5">
+          <div className="flex flex-col gap-2">
+            <label className="text-xs font-bold uppercase tracking-widest text-slate-400">Task Name</label>
+            <input name="name" required className="p-3 border border-slate-200 rounded-interactive bg-slate-50 focus:ring-2 focus:ring-primary outline-none transition-all" />
+          </div>
+          <div className="flex flex-col gap-2">
+            <label className="text-xs font-bold uppercase tracking-widest text-slate-400">Duration (Hours)</label>
+            <input name="duration" type="number" step="0.01" required className="p-3 border border-slate-200 rounded-interactive bg-slate-50 focus:ring-2 focus:ring-primary outline-none transition-all" />
+          </div>
+          <div className="grid grid-cols-2 gap-6">
+            <div className="flex flex-col gap-2">
+              <label className="text-xs font-bold uppercase tracking-widest text-slate-400">Start Date</label>
+              <input name="startDate" type="date" className="p-3 border border-slate-200 rounded-interactive bg-slate-50 focus:ring-2 focus:ring-primary outline-none transition-all" />
+            </div>
+            <div className="flex flex-col gap-2">
+              <label className="text-xs font-bold uppercase tracking-widest text-slate-400">End Date</label>
+              <input name="endDate" type="date" className="p-3 border border-slate-200 rounded-interactive bg-slate-50 focus:ring-2 focus:ring-primary outline-none transition-all" />
+            </div>
+          </div>
+          <Button type="submit" className="mt-4 w-full py-3">Create Task</Button>
+        </form>
+      </Modal>
+
+      <Modal
+        isOpen={!!editingTask}
+        onClose={() => setEditingTask(null)}
+        title="Edit Task"
+      >
+        {editingTask && (
+          <form onSubmit={handleUpdate} className="flex flex-col gap-5">
+            <div className="flex flex-col gap-2">
+              <label className="text-xs font-bold uppercase tracking-widest text-slate-400">Task Name</label>
+              <input name="name" defaultValue={editingTask.name} required className="p-3 border border-slate-200 rounded-interactive bg-slate-50 focus:ring-2 focus:ring-primary outline-none transition-all" />
+            </div>
+            <div className="flex flex-col gap-2">
+              <label className="text-xs font-bold uppercase tracking-widest text-slate-400">Duration (Hours)</label>
+              <input name="duration" type="number" step="0.01" defaultValue={editingTask.duration} required className="p-3 border border-slate-200 rounded-interactive bg-slate-50 focus:ring-2 focus:ring-primary outline-none transition-all" />
+            </div>
+            <div className="grid grid-cols-2 gap-6">
+              <div className="flex flex-col gap-2">
+                <label className="text-xs font-bold uppercase tracking-widest text-slate-400">Start Date</label>
+                <input name="startDate" type="date" defaultValue={editingTask.startDate || ''} className="p-3 border border-slate-200 rounded-interactive bg-slate-50 focus:ring-2 focus:ring-primary outline-none transition-all" />
+              </div>
+              <div className="flex flex-col gap-2">
+                <label className="text-xs font-bold uppercase tracking-widest text-slate-400">End Date</label>
+                <input name="endDate" type="date" defaultValue={editingTask.endDate || ''} className="p-3 border border-slate-200 rounded-interactive bg-slate-50 focus:ring-2 focus:ring-primary outline-none transition-all" />
+              </div>
+            </div>
+            <Button type="submit" className="mt-4 w-full py-3">Update Task</Button>
+          </form>
+        )}
+      </Modal>
+
+      <Modal
+        isOpen={isDepOpen}
+        onClose={() => setIsDepOpen(false)}
+        title="Link Dependency"
+      >
+        <form onSubmit={handleAddDependency} className="flex flex-col gap-5">
+          <div className="flex flex-col gap-2">
+            <label className="text-xs font-bold uppercase tracking-widest text-slate-400">Prerequisite Task (Parent)</label>
+            <select name="parent" required className="p-3 border border-slate-200 rounded-interactive bg-slate-50 focus:ring-2 focus:ring-primary outline-none transition-all">
+              <option value="">Select task...</option>
+              {tasks.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
+            </select>
+          </div>
+          <div className="flex flex-col gap-2">
+            <label className="text-xs font-bold uppercase tracking-widest text-slate-400">Dependent Task (Child)</label>
+            <select name="child" required className="p-3 border border-slate-200 rounded-interactive bg-slate-50 focus:ring-2 focus:ring-primary outline-none transition-all">
+              <option value="">Select task...</option>
+              {tasks.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
+            </select>
+          </div>
+          <Button type="submit" className="mt-4 w-full py-3">Create Dependency</Button>
+        </form>
+      </Modal>
+    </div>
+  );
+};
+\n
+--- FILE: components/layout/Navbar.tsx ---
+import React from 'react';
+import Link from 'next/link';
+
+export const Navbar = () => {
+  return (
+    <nav className="h-16 border-b border-slate-200 bg-white px-6 flex items-center justify-between sticky top-0 z-40">
+      <Link href="/" className="flex items-center gap-2 font-semibold text-primary hover:opacity-80 transition-opacity">
+        <span className="text-2xl">⚙️</span>
+        <span>OptiTask Orchestrator</span>
+      </Link>
+      <div className="flex items-center gap-6 text-sm font-medium text-slate-600">
+        <Link href="/dashboard" className="hover:text-primary transition-colors">Dashboard</Link>
+        <Link href="/allocate" className="hover:text-primary transition-colors">Allocate</Link>
+        <Link href="/specialist" className="hover:text-primary transition-colors">Specialist View</Link>
+      </div>
+    </nav>
+  );
+};
+\n
+--- FILE: components/layout/PageHeader.tsx ---
+import React from 'react';
+
+type PageHeaderProps = {
+  title: string;
+  subtitle?: string;
+  children?: React.ReactNode;
+};
+
+export const PageHeader = ({ title, subtitle, children }: PageHeaderProps) => {
+  return (
+    <div className="mb-8 flex flex-col md:flex-row md:items-end justify-between gap-4">
+      <div>
+        <h1 className="text-3xl font-semibold text-slate-900 tracking-tight">{title}</h1>
+        {subtitle && <p className="text-slate-500 mt-1">{subtitle}</p>}
+      </div>
+      <div>
+        {children}
+      </div>
+    </div>
+  );
+};
+\n
+--- FILE: components/ui/Button.tsx ---
+import React from 'react';
+
+type ButtonProps = {
+  children: React.ReactNode;
+  onClick?: () => void;
+  className?: string;
+  variant?: 'primary' | 'ghost' | 'outline';
+  disabled?: boolean;
+  ariaLabel?: string;
+};
+
+export const Button = ({
+  children,
+  onClick,
+  className = '',
+  variant = 'primary',
+  disabled = false,
+  ariaLabel
+}: ButtonProps) => {
+  const baseStyles = "px-4 py-2 rounded-interactive font-medium transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed";
+
+  const variants = {
+    primary: "bg-primary text-white hover:bg-primary-dark",
+    ghost: "bg-transparent text-slate-700 hover:bg-slate-200",
+    outline: "bg-transparent border border-slate-200 text-slate-700 hover:bg-slate-50"
+  };
+
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      aria-label={ariaLabel || (typeof children === 'string' ? children : undefined)}
+      className={`${baseStyles} ${variants[variant]} ${className}`}
+    >
+      {children}
+    </button>
+  );
+};
+\n
+--- FILE: components/ui/Card.tsx ---
+import React from 'react';
+
+type CardProps = {
+  children: React.ReactNode;
+  className?: string;
+};
+
+export const Card = ({
+  children,
+  className = '',
+}: CardProps) => {
+  return (
+    <div className={`bg-white border border-slate-200 rounded-container p-6 shadow-sm ${className}`}>
+      {children}
+    </div>
+  );
+};
+\n
+--- FILE: components/ui/Modal.tsx ---
+'use client';
+
+import React, { useEffect } from 'react';
+import { Button } from './Button';
+
+type ModalProps = {
+  isOpen: boolean;
+  onClose: () => void;
+  title: string;
+  children: React.ReactNode;
+  footer?: React.ReactNode;
+};
+
+export const Modal = ({
+  isOpen,
+  onClose,
+  title,
+  children,
+  footer,
+}: ModalProps) => {
+  useEffect(() => {
+    if (isOpen) {
+      document.body.style.overflow = 'hidden';
+    } else {
+      document.body.style.overflow = 'unset';
+    }
+  }, [isOpen]);
+
+  if (!isOpen) return null;
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/20 backdrop-blur-sm">
+      <div className="bg-white rounded-container w-full max-w-md overflow-hidden shadow-2xl animate-in fade-in zoom-in duration-200">
+        <div className="bg-primary p-4 text-white font-medium">
+          {title}
+        </div>
+        <div className="p-6">
+          {children}
+        </div>
+        {footer && (
+          <div className="p-4 border-t border-slate-200 bg-slate-50 flex justify-end gap-3">
+            {footer}
+          </div>
+        )}
+        {!footer && (
+          <div className="p-4 border-t border-slate-200 flex justify-end">
+            <Button variant="ghost" onClick={onClose}>Close</Button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+\n

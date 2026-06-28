@@ -10,11 +10,29 @@ export type Task = {
   startDate: string | null;
   endDate: string | null;
   status: string;
+  isBlocked: boolean;
 };
 
 export async function getTasks() {
-  const rows = db.prepare('SELECT * FROM tasks').all();
-  return rows as Task[];
+  const rows = db.prepare('SELECT * FROM tasks').all() as any[];
+
+  return Promise.all(rows.map(async (row) => {
+    const prerequisites = db.prepare('SELECT parentTaskId FROM dependencies WHERE childTaskId = ?').all(row.id) as { parentTaskId: number }[];
+
+    let isBlocked = false;
+    for (const { parentTaskId } of prerequisites) {
+      const parent = db.prepare('SELECT status FROM tasks WHERE id = ?').get(parentTaskId) as { status: string } | undefined;
+      if (!parent || parent.status !== 'Complete') {
+        isBlocked = true;
+        break;
+      }
+    }
+
+    return {
+      ...row,
+      isBlocked
+    };
+  })) as Promise<Task[]>;
 }
 
 export async function createTask(data: { name: string; duration: number; startDate?: string; endDate?: string }) {

@@ -114,11 +114,11 @@ export const TaskManagement = () => {
                   📝
                 </div>
                 <div>
-                  <h3 className="font-semibold text-slate-900">{t.name}</h3>
+                  <h3 className="font-semibold text-slate-900">{t.name} {t.isBlocked && <span className="ml-2 text-[10px] bg-critical/20 text-critical-dark px-2 py-0.5 rounded-full font-bold uppercase">Blocked</span>}</h3>
                   <div className="flex items-center gap-3 text-xs text-slate-500">
                     <span>Duration: <span className="font-medium text-slate-700">{t.duration}h</span></span>
                     <span className="text-slate-300">|</span>
-                    <span>Status: <span className="font-medium text-slate-700">{t.status}</span></span>
+                    <span>Status: <span className={`font-medium ${t.isBlocked ? 'text-critical' : 'text-slate-700'}`}>{t.isBlocked ? 'Blocked' : t.status}</span></span>
                     {t.startDate && (
                       <>
                         <span className="text-slate-300">|</span>

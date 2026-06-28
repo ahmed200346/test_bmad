@@ -13,6 +13,12 @@ export type Risk = {
 export async function getScheduleRisks() {
   const risks: Risk[] = [];
 
+  // Define window for constraint check (Current Week)
+  const today = new Date().toISOString().split('T')[0];
+  const nextWeek = new Date();
+  nextWeek.setDate(nextWeek.getDate() + 7);
+  const end = nextWeek.toISOString().split('T')[0];
+
   // Detect Slippage: Task A -> Task B where A.endDate > B.startDate
   const slippages = db.prepare(`
     SELECT
@@ -37,14 +43,14 @@ export async function getScheduleRisks() {
     });
   });
 
-  // Detect Constraints: Over-allocated specialists
+  // Detect Constraints: Over-allocated specialists in the current window
   const overloads = db.prepare(`
     SELECT s.id, s.name as title,
-    (SELECT SUM(hours) FROM allocations WHERE specialistId = s.id) as totalHours,
+    (SELECT SUM(hours) FROM allocations WHERE specialistId = s.id AND windowStart >= ? AND windowEnd <= ?) as totalHours,
     s.availabilityHoursPerWeek as capacity
     FROM specialists s
     WHERE s.isActive = 1
-  `).all() as any[];
+  `, [today, end]).all() as any[];
 
   overloads.forEach(o => {
     const load = (o.totalHours || 0);
@@ -54,7 +60,7 @@ export async function getScheduleRisks() {
         type: 'Constraint',
         title: o.title,
         severity: 'warning',
-        desc: `Load is ${((load / o.capacity) * 100).toFixed(1)}% (${load}h / ${o.capacity}h).`
+        desc: `Current window load is ${((load / o.capacity) * 100).toFixed(1)}% (${load}h / ${o.capacity}h).`
       });
     }
   });

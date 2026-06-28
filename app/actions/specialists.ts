@@ -5,7 +5,6 @@ import { revalidatePath } from 'next/cache';
 import { calculateSpecialistCapacity } from './capacity';
 
 export type Specialist = {
-// ... (existing type)
   id: number;
   name: string;
   skillTags: string[];
@@ -14,11 +13,6 @@ export type Specialist = {
   isActive: boolean;
 };
 
-<<<<<<< HEAD
-export async function getSpecialists() {
-  const rows = db.prepare('SELECT * FROM specialists').all() as any[];
-  return rows.map(row => ({
-=======
 export async function getSpecialists(filters?: {
   skill?: string;
   seniority?: string;
@@ -32,29 +26,18 @@ export async function getSpecialists(filters?: {
     params.push(filters.seniority);
   }
 
-  if (!filters?.onlyAvailable === false) {
-    // If onlyAvailable is true, we need to check their current load
-    // For simplicity in this phase, we'll filter by isActive first,
-    // and then we would normally join with the allocations table to check load.
-  }
-
-  // isActive is a base requirement for "Available" in Story 1.4
   if (filters?.onlyAvailable) {
     query += ' AND isActive = 1';
-    // In a full implementation, this would also join with the allocations table
-    // to ensure sum(hours) < availabilityHoursPerWeek for the current window.
   }
 
   const rows = db.prepare(query).all(...params);
 
   let specialists = rows.map(row => ({
->>>>>>> bee5cf50f980be97591ae90a1978ef89969a47b2
     ...row,
     skillTags: JSON.parse(row.skillTags || '[]'),
     isActive: !!row.isActive
   })) as Specialist[];
 
-  // Client-side filtering for skillTags since it's stored as JSON in SQLite
   if (filters?.skill) {
     const searchSkill = filters.skill.toLowerCase();
     specialists = specialists.filter(s =>
@@ -65,20 +48,24 @@ export async function getSpecialists(filters?: {
   return specialists;
 }
 
-export async function createSpecialist(data: Omit<Specialist, 'id'>) {
-  const stmt = db.prepare(
-    'INSERT INTO specialists (name, skillTags, seniority, availabilityHoursPerWeek, isActive) VALUES (?, ?, ?, ?, ?)'
-  );
-  const info = stmt.run(
-    data.name,
-    JSON.stringify(data.skillTags),
-    data.seniority,
-    data.availabilityHoursPerWeek,
-    data.isActive ? 1 : 0
-  );
-  revalidatePath('/dashboard');
-  revalidatePath('/specialists');
-  return info.lastInsertRowid;
+import { secureAction } from '@/lib/secure-action';
+
+export async function createSpecialist(token: string | undefined, data: Omit<Specialist, 'id'>) {
+  return secureAction(token, 'PM', 'createSpecialist', async () => {
+    const stmt = db.prepare(
+      'INSERT INTO specialists (name, skillTags, seniority, availabilityHoursPerWeek, isActive) VALUES (?, ?, ?, ?, ?)'
+    );
+    const info = stmt.run(
+      data.name,
+      JSON.stringify(data.skillTags),
+      data.seniority,
+      data.availabilityHoursPerWeek,
+      data.isActive ? 1 : 0
+    );
+    revalidatePath('/dashboard');
+    revalidatePath('/specialists');
+    return info.lastInsertRowid;
+  });
 }
 
 export async function updateSpecialist(id: number, data: Partial<Specialist>) {
