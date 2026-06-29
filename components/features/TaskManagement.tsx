@@ -29,16 +29,16 @@ export const TaskManagement = () => {
     const data = {
       name: formData.get('name') as string,
       duration: parseFloat(formData.get('duration') as string),
-      startDate: formData.get('startDate') as string,
-      endDate: formData.get('endDate') as string,
+      startDate: (formData.get('startDate') as string) || undefined,
+      endDate: (formData.get('endDate') as string) || undefined,
     };
 
     try {
       await createTask(data);
       setIsCreateOpen(false);
       loadTasks();
-    } catch (err: any) {
-      setError(err.message);
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : 'Failed to create task');
     }
   };
 
@@ -50,16 +50,16 @@ export const TaskManagement = () => {
     const data = {
       name: formData.get('name') as string,
       duration: parseFloat(formData.get('duration') as string),
-      startDate: formData.get('startDate') as string,
-      endDate: formData.get('endDate') as string,
+      startDate: (formData.get('startDate') as string) || undefined,
+      endDate: (formData.get('endDate') as string) || undefined,
     };
 
     try {
       await updateTask(editingTask.id, data);
       setEditingTask(null);
       loadTasks();
-    } catch (err: any) {
-      setError(err.message);
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : 'Failed to update task');
     }
   };
 
@@ -74,8 +74,8 @@ export const TaskManagement = () => {
       await addDependency(parentId, childId);
       setIsDepOpen(false);
       loadTasks();
-    } catch (err: any) {
-      setError(err.message);
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : 'Failed to add dependency');
     }
   };
 

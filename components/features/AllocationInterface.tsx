@@ -6,16 +6,24 @@ import { Button } from '../ui/Button';
 import { OverrideModal } from './OverrideModal';
 import { getSpecialists, Specialist } from '@/app/actions/specialists';
 import { getTasks, Task } from '@/app/actions/tasks';
-import { validateAllocation, allocateTask, AllocationRequest } from '@/app/actions/engine';
+import { validateAllocation, allocateTask } from '@/app/actions/engine';
+
+type ValidationResult = {
+  valid: boolean;
+  percentage: number;
+  error?: string;
+};
 
 export const AllocationInterface = () => {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [specialists, setSpecialists] = useState<Specialist[]>([]);
   const [selectedTask, setSelectedTask] = useState<string>('');
   const [selectedSpecialist, setSelectedSpecialist] = useState<string>('');
-  const [validation, setValidation] = useState<{ valid: boolean; error: string; percentage: number } | null>(null);
+  const [validation, setValidation] = useState<ValidationResult | null>(null);
   const [isOverrideOpen, setIsOverrideOpen] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
+  const [successMessage, setSuccessMessage] = useState<string | null>(null);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   useEffect(() => {
     const loadData = async () => {
@@ -44,20 +52,30 @@ export const AllocationInterface = () => {
       nextWeek.setDate(nextWeek.getDate() + 7);
       const end = nextWeek.toISOString().split('T')[0];
 
-      const result = await validateAllocation({
-        specialistId: spec.id,
-        taskId: task.id,
-        hours: task.duration,
-        windowStart: today,
-        windowEnd: end,
-      });
-      setValidation(result);
+      try {
+        const result = await validateAllocation({
+          specialistId: spec.id,
+          taskId: task.id,
+          hours: task.duration,
+          windowStart: today,
+          windowEnd: end,
+        });
+        setValidation(result);
+      } catch (err: unknown) {
+        setValidation({
+          valid: false,
+          percentage: 0,
+          error: err instanceof Error ? err.message : 'Validation failed',
+        });
+      }
     };
     checkCapacity();
   }, [selectedTask, selectedSpecialist, tasks, specialists]);
 
   const handleSave = async (overrideData?: { priority: string; rationale: string }) => {
     setIsSaving(true);
+    setSuccessMessage(null);
+    setErrorMessage(null);
     try {
       const task = tasks.find(t => t.id.toString() === selectedTask);
       const spec = specialists.find(s => s.id.toString() === selectedSpecialist);
@@ -80,9 +98,9 @@ export const AllocationInterface = () => {
       setSelectedSpecialist('');
       setValidation(null);
       setIsOverrideOpen(false);
-      alert("Allocation saved successfully.");
-    } catch (err: any) {
-      alert(err.message);
+      setSuccessMessage("Allocation saved successfully.");
+    } catch (err: unknown) {
+      setErrorMessage(err instanceof Error ? err.message : 'Failed to save allocation');
     } finally {
       setIsSaving(false);
     }
@@ -90,28 +108,42 @@ export const AllocationInterface = () => {
 
   return (
     <>
+      {successMessage && (
+        <div className="mb-4 p-4 bg-success/10 border border-success/20 text-success-dark text-sm rounded-interactive max-w-2xl mx-auto">
+          {successMessage}
+        </div>
+      )}
+      {errorMessage && (
+        <div className="mb-4 p-4 bg-critical/10 border border-critical/20 text-critical-dark text-sm rounded-interactive max-w-2xl mx-auto">
+          {errorMessage}
+        </div>
+      )}
       <Card className="max-w-2xl mx-auto border-none shadow-md bg-white">
         <div className="flex flex-col gap-10 p-6">
           <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
             <div className="flex flex-col gap-3">
-              <label className="text-xs font-bold uppercase tracking-widest text-slate-400">Task Selection</label>
+              <label htmlFor="task-select" className="text-xs font-bold uppercase tracking-widest text-slate-400">Task Selection</label>
               <select
+                id="task-select"
+                aria-label="Task Selection"
                 className="p-3 border border-slate-200 rounded-interactive bg-slate-50 text-slate-900 focus:ring-2 focus:ring-primary outline-none transition-all cursor-pointer"
                 value={selectedTask}
                 onChange={(e) => setSelectedTask(e.target.value)}
               >
-                <option value="">Select a task...</option>
+                <option value="" disabled>Task Selection</option>
                 {tasks.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
               </select>
             </div>
             <div className="flex flex-col gap-3">
-              <label className="text-xs font-bold uppercase tracking-widest text-slate-400">Specialist Selection</label>
+              <label htmlFor="specialist-select" className="text-xs font-bold uppercase tracking-widest text-slate-400">Specialist Selection</label>
               <select
+                id="specialist-select"
+                aria-label="Specialist Selection"
                 className="p-3 border border-slate-200 rounded-interactive bg-slate-50 text-slate-900 focus:ring-2 focus:ring-primary outline-none transition-all cursor-pointer"
                 value={selectedSpecialist}
                 onChange={(e) => setSelectedSpecialist(e.target.value)}
               >
-                <option value="">Select a specialist...</option>
+                <option value="" disabled>Specialist Selection</option>
                 {specialists.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
               </select>
             </div>
@@ -133,7 +165,9 @@ export const AllocationInterface = () => {
                 {!selectedSpecialist ? (
                   "Please select a specialist to validate capacity constraints."
                 ) : validation?.valid === false ? (
-                  validation.error
+                  validation.error?.includes('Capacity Exceeded')
+                    ? 'Capacity Exceeded'
+                    : validation.error
                 ) : (
                   `Sustainable Allocation: Current load is ${validation?.percentage.toFixed(1)}%.`
                 )}
@@ -151,7 +185,7 @@ export const AllocationInterface = () => {
               Request Override
             </Button>
             <Button
-              disabled={!selectedTask || !selectedSpecialist || (validation && !validation.valid)}
+              disabled={!selectedTask || !selectedSpecialist || (validation !== null && !validation.valid)}
               onClick={() => handleSave()}
               className="px-6 shadow-sm"
             >

@@ -11,15 +11,12 @@ export class AuditLog {
       .update(previousHash + action + dataString)
       .digest('hex');
 
-    db.prepare(
-      'INSERT INTO audit_log (action, data, hash, previousHash) VALUES (?, ?, ?, ?)',
-      [action, dataString, hash, previousHash]
-    ).run();
+    db.prepare('INSERT INTO audit_log (action, data, hash, previousHash) VALUES (?, ?, ?, ?)').run(action, dataString, hash, previousHash);
 
     return hash;
   }
 
-  static async verifyIntegrity(): { valid: boolean; brokenAt?: number } {
+  static verifyIntegrity(): { valid: boolean; brokenAt?: number } {
     const logs = db.prepare('SELECT * FROM audit_log ORDER BY id ASC').all() as any[];
     let lastHash = '0';
 

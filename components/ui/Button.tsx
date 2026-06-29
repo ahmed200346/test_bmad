@@ -6,6 +6,7 @@ type ButtonProps = {
   className?: string;
   variant?: 'primary' | 'ghost' | 'outline';
   disabled?: boolean;
+  type?: 'button' | 'submit' | 'reset';
   ariaLabel?: string;
 };
 
@@ -15,6 +16,7 @@ export const Button = ({
   className = '',
   variant = 'primary',
   disabled = false,
+  type = 'button',
   ariaLabel
 }: ButtonProps) => {
   const baseStyles = "px-4 py-2 rounded-interactive font-medium transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed";
@@ -27,6 +29,7 @@ export const Button = ({
 
   return (
     <button
+      type={type}
       onClick={onClick}
       disabled={disabled}
       aria-label={ariaLabel || (typeof children === 'string' ? children : undefined)}
