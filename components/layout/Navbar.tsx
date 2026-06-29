@@ -10,6 +10,8 @@ export const Navbar = () => {
       </Link>
       <div className="flex items-center gap-6 text-sm font-medium text-slate-600">
         <Link href="/dashboard" className="hover:text-primary transition-colors">Dashboard</Link>
+        <Link href="/specialists" className="hover:text-primary transition-colors">Specialists</Link>
+        <Link href="/tasks" className="hover:text-primary transition-colors">Tasks</Link>
         <Link href="/allocate" className="hover:text-primary transition-colors">Allocate</Link>
         <Link href="/specialist" className="hover:text-primary transition-colors">Specialist View</Link>
       </div>

@@ -1,16 +1,27 @@
 import db from '../lib/db';
 
+type CapacityCheckResult = {
+  isAllowed: boolean;
+  percentage: number;
+  excess: number;
+};
+
+type SpecialistRecord = {
+  availabilityHoursPerWeek: number;
+};
+
 export class AllocationEngine {
-  static async checkCapacity(specialistId: number, hours: number, windowStart: string, windowEnd: string) {
-    const currentLoad = db.prepare(
-      'SELECT SUM(hours) as total FROM allocations WHERE specialistId = ? AND windowStart >= ? AND windowEnd <= ?',
-      [specialistId, windowStart, windowEnd]
-    ).get() as { total: number | null };
+  static async checkCapacity(specialistId: number, hours: number, windowStart: string, windowEnd: string): Promise<CapacityCheckResult> {
+    const stmt = db.prepare(
+      'SELECT SUM(hours) as total FROM allocations WHERE specialistId = ? AND windowStart >= ? AND windowEnd <= ?'
+    );
+    const currentLoad = stmt.get(specialistId, windowStart, windowEnd) as { total: number | null };
 
     const total = currentLoad?.total || 0;
 
     // Get specialist availability
-    const spec = db.prepare('SELECT availabilityHoursPerWeek FROM specialists WHERE id = ?').get() as { availabilityHoursPerWeek: number } | undefined;
+    const specStmt = db.prepare('SELECT availabilityHoursPerWeek FROM specialists WHERE id = ?');
+    const spec = specStmt.get(specialistId) as SpecialistRecord | undefined;
 
     if (!spec) throw new Error("Specialist not found");
 
@@ -24,16 +35,14 @@ export class AllocationEngine {
     };
   }
 
-  static async allocate(specialistId: number, taskId: number, hours: number, windowStart: string, windowEnd: string) {
+  static async allocate(specialistId: number, taskId: number, hours: number, windowStart: string, windowEnd: string): Promise<void> {
     const check = await this.checkCapacity(specialistId, hours, windowStart, windowEnd);
 
     if (!check.isAllowed) {
       throw new Error(`Capacity Exceeded: This assignment would push the specialist to ${check.percentage.toFixed(1)}%`);
     }
 
-    db.prepare(
-      'INSERT INTO allocations (specialistId, taskId, hours, windowStart, windowEnd) VALUES (?, ?, ?, ?, ?)',
-      [specialistId, taskId, hours, windowStart, windowEnd]
-    ).run();
+    const insertStmt = db.prepare('INSERT INTO allocations (specialistId, taskId, hours, windowStart, windowEnd) VALUES (?, ?, ?, ?, ?)');
+    insertStmt.run(specialistId, taskId, hours, windowStart, windowEnd);
   }
 }

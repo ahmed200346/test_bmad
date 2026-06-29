@@ -1,23 +1,27 @@
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap");
 @import "tailwindcss";
 
 @theme {
   /* Core Palette - Calm Productivity */
-  --color-primary: #4A6D8C;    /* Slate Blue - Trust, Professionalism */
-  --color-secondary: #F8FAFC;  /* Off-White - Calm, Airy background */
-  --color-success: #86EFAC;    /* Soft Green - Positive flow */
-  --color-warning: #FDE68A;    /* Muted Amber - Attention needed */
-  --color-critical: #FCA5A5;   /* Deep Coral - Urgent risk */
+  --color-primary: #4A6D8C;
+  --color-secondary: #F8FAFC;
+  --color-success: #86EFAC;
+  --color-warning: #FDE68A;
+  --color-critical: #FCA5A5;
 
-  /* Neutrals for "Calm" aesthetic */
+  /* Neutrals */
   --color-slate-50: #F9FAFB;
   --color-slate-200: #E2E8F0;
+  --color-slate-400: #94A3B8;
+  --color-slate-500: #64748B;
+  --color-slate-600: #475569;
   --color-slate-700: #334155;
   --color-slate-900: #0F172A;
 
   /* Typography */
   --font-inter: "Inter", ui-sans-serif, system-ui, sans-serif;
 
-  /* Custom Spacing for High White Space */
+  /* Spacing */
   --spacing-section: 4rem;
   --spacing-gap: 2rem;
 }
@@ -35,7 +39,6 @@ body {
   -moz-osx-font-smoothing: grayscale;
 }
 
-/* Smooth transitions for a "calm" feel */
 * {
-  transition: background-color 0.2s ease, border-color 0.2s ease, color 0.2s ease;
+  @apply transition-colors duration-200 ease-in-out;
 }

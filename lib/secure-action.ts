@@ -3,9 +3,9 @@ import { AuditLog } from './audit';
 
 export async function secureAction<T>(
   token: string | undefined,
-  requiredRole?: 'PM' | 'SPECIALIST',
   actionName: string,
-  fn: (user: UserSession) => Promise<T>
+  fn: (user: UserSession) => Promise<T>,
+  requiredRole?: 'PM' | 'SPECIALIST'
 ): Promise<T> {
   // 1. TLS Check (Mocked)
   // In production, this would check the 'x-forwarded-proto' header or use a secure transport check

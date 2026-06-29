@@ -37,7 +37,7 @@ export async function getTasks() {
 
 export async function createTask(data: { name: string; duration: number; startDate?: string; endDate?: string }) {
   if (data.duration < 0.25) {
-    throw new Error("Task duration must be at least 0.25 hours.");
+    throw new Error("Task duration must be at least 0.25 hours");
   }
 
   const stmt = db.prepare(
@@ -54,7 +54,7 @@ export async function updateTask(id: number, data: Partial<Task>) {
 
   if (data.name !== undefined) { updates.push('name = ?'); params.push(data.name); }
   if (data.duration !== undefined) {
-    if (data.duration < 0.25) throw new Error("Task duration must be at least 0.25 hours.");
+    if (data.duration < 0.25) throw new Error("Task duration must be at least 0.25 hours");
     updates.push('duration = ?');
     params.push(data.duration);
   }

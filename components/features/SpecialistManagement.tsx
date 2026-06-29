@@ -5,11 +5,14 @@ import { Card } from '../ui/Card';
 import { Button } from '../ui/Button';
 import { Modal } from '../ui/Modal';
 import { getSpecialists, createSpecialist, updateSpecialist, deactivateSpecialist, getFilteredSpecialists, Specialist } from '@/app/actions/specialists';
+import { getDevToken } from '@/app/actions/auth';
 
 export const SpecialistManagement = () => {
   const [specialists, setSpecialists] = useState<Specialist[]>([]);
   const [isCreateOpen, setIsCreateOpen] = useState(false);
   const [editingSpecialist, setEditingSpecialist] = useState<Specialist | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [pmToken, setPmToken] = useState<string>('');
 
   const [filters, setFilters] = useState({
     seniority: '',
@@ -18,6 +21,10 @@ export const SpecialistManagement = () => {
     windowStart: new Date().toISOString().split('T')[0],
     windowEnd: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0]
   });
+
+  useEffect(() => {
+    getDevToken('PM').then(setPmToken);
+  }, []);
 
   const loadSpecialists = async () => {
     let data;
@@ -41,17 +48,22 @@ export const SpecialistManagement = () => {
 
   const handleCreate = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
+    setError(null);
     const formData = new FormData(e.currentTarget);
     const data = {
       name: formData.get('name') as string,
       skillTags: (formData.get('skills') as string).split(',').map(s => s.trim()).filter(Boolean),
-      seniority: formData.get('seniority') as any,
+      seniority: formData.get('seniority') as Specialist['seniority'],
       availabilityHoursPerWeek: parseFloat(formData.get('hours') as string),
       isActive: true
     };
-    await createSpecialist(data);
-    setIsCreateOpen(false);
-    loadSpecialists();
+    try {
+      await createSpecialist(data, pmToken);
+      setIsCreateOpen(false);
+      loadSpecialists();
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : 'Failed to create specialist');
+    }
   };
 
   const handleUpdate = async (e: React.FormEvent<HTMLFormElement>) => {
@@ -84,6 +96,12 @@ export const SpecialistManagement = () => {
         <Button onClick={() => setIsCreateOpen(true)}>Add Specialist</Button>
       </div>
 
+      {error && (
+        <div className="p-4 bg-critical/10 border border-critical/20 text-critical-dark text-sm rounded-interactive">
+          <span className="font-bold">⚠️ Error: </span>{error}
+        </div>
+      )}
+
       {/* Filter Bar - Calm Productivity style */}
       <Card className="p-4 border-none shadow-sm bg-white/50 backdrop-blur-sm">
         <div className="flex flex-col md:flex-row gap-4 items-center">
@@ -99,6 +117,7 @@ export const SpecialistManagement = () => {
           <div className="flex flex-col gap-1 w-full md:w-auto">
             <label className="text-[10px] font-bold uppercase tracking-widest text-slate-400">Seniority</label>
             <select
+              name="seniority"
               value={filters.seniority}
               onChange={(e) => setFilters(f => ({ ...f, seniority: e.target.value }))}
               className="p-2 text-sm border border-slate-200 rounded-interactive bg-white focus:ring-2 focus:ring-primary outline-none transition-all"

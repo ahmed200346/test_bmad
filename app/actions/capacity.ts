@@ -12,16 +12,16 @@ export async function calculateSpecialistCapacity(specialistId: number, windowSt
 }
 
 export async function getSpecialistHourlyLoad(token: string | undefined, specialistId: number) {
-  return secureAction(token, undefined, 'getSpecialistHourlyLoad', async (user) => {
+  return secureAction(token, 'getSpecialistHourlyLoad', async (user) => {
     // Privacy Wall Check: PMs can see everything, Specialists can only see themselves
-    if (user.role !== 'PM' && user.id !== specialistId) {
+    if (user.role !== 'PM' && user.specialistId !== specialistId) {
       throw new Error("403 Forbidden: You do not have permission to access this specialist's detailed load view.");
     }
 
-    const rows = db.prepare(
-      'SELECT a.windowStart, a.hours, t.name as taskName FROM allocations a JOIN tasks t ON a.taskId = t.id WHERE a.specialistId = ? ORDER BY a.windowStart ASC',
-      [specialistId]
-    ).all() as any[];
+    const stmt = db.prepare(
+      'SELECT a.windowStart, a.hours, t.name as taskName FROM allocations a JOIN tasks t ON a.taskId = t.id WHERE a.specialistId = ? ORDER BY a.windowStart ASC'
+    );
+    const rows = stmt.all(specialistId) as any[];
 
     return rows;
   });

@@ -44,13 +44,14 @@ export async function getScheduleRisks() {
   });
 
   // Detect Constraints: Over-allocated specialists in the current window
-  const overloads = db.prepare(`
+  const stmt = db.prepare(`
     SELECT s.id, s.name as title,
     (SELECT SUM(hours) FROM allocations WHERE specialistId = s.id AND windowStart >= ? AND windowEnd <= ?) as totalHours,
     s.availabilityHoursPerWeek as capacity
     FROM specialists s
     WHERE s.isActive = 1
-  `, [today, end]).all() as any[];
+  `);
+  const overloads = stmt.all(today, end) as any[];
 
   overloads.forEach(o => {
     const load = (o.totalHours || 0);

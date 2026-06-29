@@ -6,6 +6,7 @@ export type UserSession = {
   id: number;
   username: string;
   role: 'PM' | 'SPECIALIST';
+  specialistId?: number;
 };
 
 export async function signToken(payload: UserSession) {

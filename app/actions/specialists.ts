@@ -50,8 +50,8 @@ export async function getSpecialists(filters?: {
 
 import { secureAction } from '@/lib/secure-action';
 
-export async function createSpecialist(token: string | undefined, data: Omit<Specialist, 'id'>) {
-  return secureAction(token, 'PM', 'createSpecialist', async () => {
+export async function createSpecialist(data: Omit<Specialist, 'id'>, token?: string | undefined) {
+  return secureAction(token, 'createSpecialist', async (user) => {
     const stmt = db.prepare(
       'INSERT INTO specialists (name, skillTags, seniority, availabilityHoursPerWeek, isActive) VALUES (?, ?, ?, ?, ?)'
     );
@@ -65,7 +65,7 @@ export async function createSpecialist(token: string | undefined, data: Omit<Spe
     revalidatePath('/dashboard');
     revalidatePath('/specialists');
     return info.lastInsertRowid;
-  });
+  }, 'PM');
 }
 
 export async function updateSpecialist(id: number, data: Partial<Specialist>) {
@@ -123,3 +123,4 @@ export async function getFilteredSpecialists(filters: {
 
   return available.filter((s): s is Specialist => s !== null);
 }
+
